@@ -6,6 +6,7 @@ from pathlib import Path
 APP_DIR = Path.home() / "AppData" / "Local" / "LLM-Drop-In"
 SETTINGS_FILE = APP_DIR / "settings.json"
 HISTORY_FILE = APP_DIR / "history.json"
+TRANSACTION_DIR = APP_DIR / "transactions"
 
 
 def _load(path: Path, default):
@@ -34,3 +35,15 @@ def add_history(entry: dict, limit: int = 30) -> None:
     APP_DIR.mkdir(parents=True, exist_ok=True)
     HISTORY_FILE.write_text(json.dumps(
         history[:limit], indent=2), encoding="utf-8")
+
+
+def update_history_entry(history_id: str, **changes) -> bool:
+    history = load_history()
+    for entry in history:
+        if entry.get("id") == history_id:
+            entry.update(changes)
+            APP_DIR.mkdir(parents=True, exist_ok=True)
+            HISTORY_FILE.write_text(json.dumps(
+                history, indent=2), encoding="utf-8")
+            return True
+    return False

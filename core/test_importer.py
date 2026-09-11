@@ -6,7 +6,7 @@ from unittest import mock
 import zipfile
 from pathlib import Path
 
-from core.importer import apply_import, enrich_plan_hashes, make_plan
+from core.importer import apply_import, enrich_plan_hashes, make_plan, undo_import
 from core.zip_analyzer import analyze
 
 
@@ -24,7 +24,10 @@ class ImporterTests(unittest.TestCase):
             plan = enrich_plan_hashes(zip_path, make_plan(
                 entries, candidates[0].prefix, root))
             self.assertEqual({p.action for p in plan}, {"replace", "new"})
-            self.assertEqual(apply_import(zip_path, plan), 2)
+            applied, transaction_id = apply_import(
+                zip_path, plan, project_root=root)
+            self.assertEqual(applied, 2)
+            self.assertIsNotNone(transaction_id)
             self.assertEqual(
                 (root / "existing.txt").read_text(encoding="utf-8"), "new")
             self.assertEqual(
@@ -44,7 +47,10 @@ class ImporterTests(unittest.TestCase):
             plan = enrich_plan_hashes(zip_path, make_plan(
                 entries, candidates[0].prefix, root))
             self.assertEqual(plan[0].action, "unchanged")
-            self.assertEqual(apply_import(zip_path, plan), 0)
+            applied, transaction_id = apply_import(
+                zip_path, plan, project_root=root)
+            self.assertEqual(applied, 0)
+            self.assertIsNone(transaction_id)
             self.assertEqual(target.stat().st_mtime_ns, before)
 
     def test_traversal_is_rejected(self):
@@ -95,6 +101,46 @@ class ImporterTests(unittest.TestCase):
             self.assertEqual(
                 (root / "two.txt").read_text(encoding="utf-8"), "old-two")
 
+    def test_external_change_after_analysis_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            target = root / "existing.txt"
+            target.write_text("old", encoding="utf-8")
+            zip_path = Path(tmp) / "update.zip"
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr("existing.txt", "new")
+            entries, candidates = analyze(zip_path, root)
+            plan = enrich_plan_hashes(zip_path, make_plan(
+                entries, candidates[0].prefix, root))
+            target.write_text("changed by user", encoding="utf-8")
+            with self.assertRaises(RuntimeError):
+                apply_import(zip_path, plan, project_root=root)
+            self.assertEqual(target.read_text(
+                encoding="utf-8"), "changed by user")
 
-if __name__ == "__main__":
-    unittest.main()
+    def test_undo_restores_replaced_and_removes_new(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            (root / "existing.txt").write_text("old", encoding="utf-8")
+            zip_path = Path(tmp) / "update.zip"
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr("existing.txt", "new")
+                zf.writestr("new.txt", "created")
+            entries, candidates = analyze(zip_path, root)
+            plan = enrich_plan_hashes(zip_path, make_plan(
+                entries, candidates[0].prefix, root))
+            applied, transaction_id = apply_import(
+                zip_path, plan, project_root=root)
+            self.assertEqual(applied, 2)
+            self.assertIsNotNone(transaction_id)
+            assert transaction_id is not None
+            self.assertEqual(
+                (root / "existing.txt").read_text(encoding="utf-8"), "new")
+            assert transaction_id is not None
+            restored = undo_import(transaction_id)
+            self.assertEqual(restored, 2)
+            self.assertEqual(
+                (root / "existing.txt").read_text(encoding="utf-8"), "old")
+            self.assertFalse((root / "new.txt").exists())

@@ -7,12 +7,11 @@ from PySide6.QtGui import QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
     QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
     QMessageBox, QPushButton, QVBoxLayout, QWidget, QListWidget, QListWidgetItem,
-    QDialog,
-    QProgressBar,
+    QDialog, QProgressBar,
 )
 
-from core.importer import apply_import, enrich_plan_hashes, history_entry, make_plan
-from core.settings import add_history, load_history, load_settings, save_settings
+from core.importer import apply_import, enrich_plan_hashes, history_entry, make_plan, undo_import
+from core.settings import add_history, load_history, load_settings, save_settings, update_history_entry
 from core.zip_analyzer import analyze
 from ui.import_preview import ImportPreviewDialog
 
@@ -38,7 +37,7 @@ class ZipWorker(QObject):
 
 
 class ImportWorker(QObject):
-    succeeded = Signal(int)
+    succeeded = Signal(int, object)
     failed = Signal(str)
     finished = Signal()
 
@@ -50,8 +49,9 @@ class ImportWorker(QObject):
 
     def run(self):
         try:
-            applied = apply_import(self.path, self.plan)
-            self.succeeded.emit(applied)
+            applied, transaction_id = apply_import(
+                self.path, self.plan, project_root=self.project)
+            self.succeeded.emit(applied, transaction_id)
         except Exception as exc:
             self.failed.emit(str(exc))
         finally:
@@ -142,9 +142,15 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.progress)
 
         layout.addWidget(QLabel("RECENT IMPORTS"))
+        history_row = QHBoxLayout()
         self.history = QListWidget()
+        self.history.itemDoubleClicked.connect(self._undo_history_item)
         self.history.setMinimumHeight(180)
-        layout.addWidget(self.history)
+        history_row.addWidget(self.history, 1)
+        undo = QPushButton("Undo selected")
+        undo.clicked.connect(self._undo_history_item)
+        history_row.addWidget(undo)
+        layout.addLayout(history_row)
         self.status = QLabel()
         layout.addWidget(self.status)
 
@@ -174,7 +180,11 @@ class MainWindow(QMainWindow):
                 f"({entry.get('replaced', 0)} modified, {entry.get('new', 0)} new, "
                 f"{entry.get('unchanged', 0)} unchanged)"
             )
-            self.history.addItem(QListWidgetItem(msg))
+            if entry.get("undone"):
+                msg += "  · UNDONE"
+            item = QListWidgetItem(msg)
+            item.setData(Qt.ItemDataRole.UserRole, entry)
+            self.history.addItem(item)
 
     def choose_project(self):
         path = QFileDialog.getExistingDirectory(self, "Select project folder", str(
@@ -195,7 +205,8 @@ class MainWindow(QMainWindow):
             if not path_str:
                 return
             path = Path(path_str)
-        if not self.project or not self.project.exists():
+        project = self.project
+        if project is None or not project.exists() or not project.is_dir():
             QMessageBox.warning(self, "No project",
                                 "Select a project folder first.")
             return
@@ -208,7 +219,7 @@ class MainWindow(QMainWindow):
         self.progress.show()
         self.status.setText(f"Analyzing {path.name}…")
         self.worker_thread = QThread(self)
-        self.worker = ZipWorker(path, self.project)
+        self.worker = ZipWorker(path, project)
         self.worker.moveToThread(self.worker_thread)
         self.worker_thread.started.connect(self.worker.run)
         self.worker.analyzed.connect(self._analysis_ready)
@@ -232,6 +243,11 @@ class MainWindow(QMainWindow):
         self.status.setText("Ready")
 
     def _analysis_ready(self, path, entries, candidates):
+        project = self.project
+        if project is None or not project.exists() or not project.is_dir():
+            QMessageBox.warning(self, "No project",
+                                "Select a project folder first.")
+            return
         if not candidates:
             QMessageBox.warning(self, "No usable structure",
                                 "The ZIP does not contain any safe file paths that can be mapped into this project.")
@@ -249,11 +265,6 @@ class MainWindow(QMainWindow):
                                 "More than one ZIP root fits the project equally well. The import was not applied.")
             return
         try:
-            project = self.project
-            if project is None:
-                QMessageBox.warning(self, "No project",
-                                    "Select a project folder first.")
-                return
             plan = make_plan(entries, best.prefix, project)
             plan = enrich_plan_hashes(path, plan)
         except Exception as exc:
@@ -264,7 +275,7 @@ class MainWindow(QMainWindow):
                                 "No files were found after the detected ZIP root.")
             return
         dialog = ImportPreviewDialog(
-            project, project.name, best.prefix, plan, self)
+            project, project.name, best.prefix, plan, path, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             self.status.setText("Ready")
             return
@@ -284,15 +295,39 @@ class MainWindow(QMainWindow):
         self.worker_thread.finished.connect(self._worker_finished)
         self.worker_thread.start()
 
-    def _import_succeeded(self, applied: int):
+    def _import_succeeded(self, applied: int, transaction_id):
         path = self._pending_zip
         plan = self._pending_plan or []
         if path and self.project:
-            add_history(history_entry(path, self.project, plan))
+            add_history(history_entry(path, self.project,
+                        plan, transaction_id=transaction_id))
             self._refresh()
             self.status.setText(f"Imported {applied} files from {path.name}")
         self._pending_zip = None
         self._pending_plan = None
+
+    def _undo_history_item(self, item=None):
+        if self.worker_thread is not None:
+            return
+        row = item if item is not None else self.history.currentItem()
+        if row is None:
+            return
+        entry = row.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(entry, dict) or entry.get("undone"):
+            return
+        transaction_id = entry.get("transaction_id")
+        if not isinstance(transaction_id, str) or not transaction_id:
+            return
+        if QMessageBox.question(self, "Undo import", "Undo this import? The current files must still match the imported versions.") != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            restored = undo_import(transaction_id)
+        except Exception as exc:
+            QMessageBox.critical(self, "Cannot undo import", str(exc))
+            return
+        update_history_entry(entry.get("id", ""), undone=True)
+        self._refresh()
+        self.status.setText(f"Undid import: restored {restored} files")
 
     def _import_failed(self, message: str):
         QMessageBox.critical(
