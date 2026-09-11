@@ -5,10 +5,12 @@ import zipfile
 from collections import defaultdict
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QFontDatabase
+from PySide6.QtGui import QColor, QFontDatabase, QBrush, QTextCharFormat, QSyntaxHighlighter, QPainter, QPen
 from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
+    QStyle,
+    QStyleOptionButton,
     QDialogButtonBox,
     QFrame,
     QGridLayout,
@@ -25,6 +27,114 @@ from PySide6.QtWidgets import (
 )
 
 from core.importer import ImportItem
+
+
+class VisibleCheckBox(QCheckBox):
+    """Palette-aware checkbox with a predictable, legible indicator.
+
+    The indicator is painted from the widget palette rather than hard-coded
+    application colors, so it follows light/dark themes, accessibility
+    palettes, and user accent colors while keeping the native QCheckBox
+    interaction and keyboard behavior.
+    """
+
+    def __init__(self, label: str, parent=None):
+        super().__init__(label, parent)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMouseTracking(True)
+
+    def paintEvent(self, event):
+        option = QStyleOptionButton()
+        self.initStyleOption(option)
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        indicator = self.style().subElementRect(
+            QStyle.SubElement.SE_CheckBoxIndicator, option, self
+        )
+
+        palette = self.palette()
+        if self.isEnabled():
+            fill = (
+                palette.color(palette.ColorRole.Highlight)
+                if self.isChecked()
+                else palette.color(palette.ColorRole.Base)
+            )
+            border = palette.color(palette.ColorRole.Highlight) if self.isChecked(
+            ) else palette.color(palette.ColorRole.Mid)
+            check = palette.color(palette.ColorRole.HighlightedText)
+            text_color = palette.color(palette.ColorRole.WindowText)
+        else:
+            fill = palette.color(palette.ColorGroup.Disabled,
+                                 palette.ColorRole.Button)
+            border = palette.color(
+                palette.ColorGroup.Disabled, palette.ColorRole.Mid)
+            check = palette.color(
+                palette.ColorGroup.Disabled, palette.ColorRole.HighlightedText)
+            text_color = palette.color(
+                palette.ColorGroup.Disabled, palette.ColorRole.WindowText)
+
+        painter.setPen(QPen(border, 1.2))
+        painter.setBrush(fill)
+        painter.drawRoundedRect(indicator.adjusted(1, 1, -1, -1), 3, 3)
+
+        if self.isChecked():
+            pen = QPen(check, max(1.6, indicator.width() / 7.0))
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            painter.setPen(pen)
+            x, y, w, h = indicator.x(), indicator.y(), indicator.width(), indicator.height()
+            painter.drawLine(
+                int(round(x + w * 0.23)), int(round(y + h * 0.53)),
+                int(round(x + w * 0.43)), int(round(y + h * 0.72)),
+            )
+            painter.drawLine(
+                int(round(x + w * 0.43)), int(round(y + h * 0.72)),
+                int(round(x + w * 0.79)), int(round(y + h * 0.31)),
+            )
+
+        text_rect = self.rect().adjusted(indicator.right() + 8, 0, 0, 0)
+        painter.setPen(text_color)
+        painter.setFont(self.font())
+        flags = int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+        painter.drawText(text_rect, flags, self.text())
+
+
+class DiffHighlighter(QSyntaxHighlighter):
+    def __init__(self, document):
+        super().__init__(document)
+        self.formats = {}
+        for kind, background, foreground in (
+            ("add", "#eaf7ee", "#1f6a42"),
+            ("remove", "#fdecec", "#9a3d3d"),
+            ("meta", "#edf3fb", "#446b95"),
+            ("header", "#f1f3f4", "#5b666d"),
+        ):
+            fmt = QTextCharFormat()
+            fmt.setBackground(QBrush(QColor(background)))
+            fmt.setForeground(QBrush(QColor(foreground)))
+            self.formats[kind] = fmt
+
+    def highlightBlock(self, text: str):
+        if text.startswith("+++") or text.startswith("---"):
+            self.setFormat(0, len(text), self.formats["header"])
+        elif text.startswith("@@"):
+            self.setFormat(0, len(text), self.formats["meta"])
+        elif text.startswith("+"):
+            self.setFormat(0, len(text), self.formats["add"])
+        elif text.startswith("-"):
+            self.setFormat(0, len(text), self.formats["remove"])
+
+
+class DiffView(QPlainTextEdit):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.highlighter = DiffHighlighter(self.document())
+
+    def show_diff(self, text: str):
+        self.setPlainText(text)
+        self.highlighter.rehighlight()
 
 
 class ImportPreviewDialog(QDialog):
@@ -97,7 +207,7 @@ class ImportPreviewDialog(QDialog):
         files_title.setObjectName("SectionTitle")
         files_header.addWidget(files_title)
         files_header.addStretch()
-        self.only_changed = QCheckBox("Changed only")
+        self.only_changed = VisibleCheckBox("Changed only")
         self.only_changed.setChecked(True)
         self.only_changed.toggled.connect(self._apply_filter)
         files_header.addWidget(self.only_changed)
@@ -105,8 +215,8 @@ class ImportPreviewDialog(QDialog):
 
         self.tree = QTreeWidget()
         self.tree.setObjectName("FileTree")
-        self.tree.setColumnCount(2)
-        self.tree.setHeaderLabels(["Path", "Size"])
+        self.tree.setColumnCount(3)
+        self.tree.setHeaderLabels(["Path", "Change", "Size"])
         self.tree.setRootIsDecorated(True)
         self.tree.setUniformRowHeights(True)
         self.tree.setAlternatingRowColors(False)
@@ -117,6 +227,8 @@ class ImportPreviewDialog(QDialog):
         self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.tree.header().setSectionResizeMode(
             1, QHeaderView.ResizeMode.ResizeToContents)
+        self.tree.header().setSectionResizeMode(
+            2, QHeaderView.ResizeMode.ResizeToContents)
         left_layout.addWidget(self.tree, 1)
         splitter.addWidget(left)
 
@@ -130,7 +242,21 @@ class ImportPreviewDialog(QDialog):
         self.diff_title.setWordWrap(True)
         right_layout.addWidget(self.diff_title)
 
-        self.diff = QPlainTextEdit()
+        legend = QHBoxLayout()
+        for label, color in (("Added", "#eef8f1"), ("Removed", "#fff0f0"), ("Hunk", "#edf4fb")):
+            swatch = QLabel()
+            swatch.setFixedSize(12, 12)
+            swatch.setStyleSheet(
+                f"background:{color};border:1px solid #d5dde0;border-radius:3px;")
+            text = QLabel(label)
+            text.setObjectName("DiffLegend")
+            legend.addWidget(swatch)
+            legend.addWidget(text)
+            legend.addSpacing(8)
+        legend.addStretch()
+        right_layout.addLayout(legend)
+
+        self.diff = DiffView()
         self.diff.setReadOnly(True)
         self.diff.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         self.diff.setPlaceholderText("A file diff will appear here.")
@@ -142,7 +268,7 @@ class ImportPreviewDialog(QDialog):
         layout.addWidget(splitter, 1)
 
         footer = QHBoxLayout()
-        self.select_all = QCheckBox("Select all changed files")
+        self.select_all = VisibleCheckBox("Select all changed files")
         self.select_all.setChecked(True)
         self.select_all.toggled.connect(self._toggle_all)
         footer.addWidget(self.select_all)
@@ -162,15 +288,15 @@ class ImportPreviewDialog(QDialog):
         layout.addWidget(buttons)
 
         self.setStyleSheet('''
-            QDialog { background: #f3f5f7; }
-            QWidget { color: #20252b; font-size: 10pt; }
-            QLabel#PreviewTitle { font-size: 20pt; font-weight: 700; color: #171b20; }
-            QLabel#PreviewSubtitle { color: #707780; }
-            QLabel#SectionTitle { font-size: 11pt; font-weight: 700; color: #30373d; }
+            QDialog { background: #f4f6f7; }
+            QWidget { color: #20272c; font-size: 10pt; }
+            QLabel#PreviewTitle { font-size: 20pt; font-weight: 700; color: #172027; }
+            QLabel#PreviewSubtitle { color: #707a82; }
+            QLabel#SectionTitle { font-size: 11pt; font-weight: 700; color: #2a343a; }
             QFrame#InfoCard {
                 background: #ffffff;
-                border: 1px solid #dfe3e8;
-                border-radius: 10px;
+                border: 1px solid #dce2e5;
+                border-radius: 11px;
             }
             QLabel#DetectedRoot { color: #30373d; }
             QLabel#StatValue { font-size: 13pt; font-weight: 700; color: #20252b; }
@@ -178,11 +304,13 @@ class ImportPreviewDialog(QDialog):
             QLabel#StatHint { color: #808890; font-size: 9pt; }
             QTreeWidget, QPlainTextEdit {
                 background: #ffffff;
-                border: 1px solid #d8dde3;
-                border-radius: 9px;
+                border: 1px solid #d5dde0;
+                border-radius: 10px;
+                selection-background-color: #e2efeb;
+                selection-color: #1d2a27;
             }
             QTreeWidget::item {
-                padding: 7px 4px;
+                padding: 7px 5px;
                 border-bottom: 1px solid #edf0f2;
             }
             QTreeWidget::item:selected {
@@ -200,10 +328,11 @@ class ImportPreviewDialog(QDialog):
             }
             QLabel#DiffTitle {
                 background: #ffffff;
-                border: 1px solid #dfe3e8;
-                border-radius: 8px;
+                border: 1px solid #dce2e5;
+                border-radius: 9px;
                 padding: 9px 11px;
             }
+            QLabel#DiffLegend { color: #6f797f; font-size: 9pt; }
             QLabel#SelectionSummary { color: #59616a; }
             QPushButton {
                 background: #276b5f;
@@ -215,7 +344,7 @@ class ImportPreviewDialog(QDialog):
             }
             QPushButton:hover { background: #215b51; }
             QPushButton:disabled { background: #d9dddf; color: #8a9298; }
-            QCheckBox { color: #4e565d; }
+            QCheckBox { color: #4e565d; font-weight: 600; }
         ''')
 
         self._populate_tree()
@@ -243,21 +372,31 @@ class ImportPreviewDialog(QDialog):
         order = [("replace", "Modified"), ("new", "New"),
                  ("unchanged", "Unchanged")]
         roots = {}
+        group_styles = {
+            "replace": ("#fff0f0", "#963b3b", "Replace"),
+            "new": ("#eef8f1", "#23613f", "Add"),
+            "unchanged": ("#f1f3f4", "#69747b", "Same"),
+        }
         for action, label in order:
             items = self._items_by_action.get(action, [])
-            root = QTreeWidgetItem([f"{label}  ({len(items)})", ""])
+            bg, fg, action_label = group_styles[action]
+            root = QTreeWidgetItem([f"{label}  ·  {len(items)}", "", ""])
             root.setExpanded(action != "unchanged")
             root.setFirstColumnSpanned(False)
             root.setFlags(Qt.ItemFlag.ItemIsEnabled |
                           Qt.ItemFlag.ItemIsSelectable)
+            root.setBackground(0, QBrush(QColor(bg)))
+            root.setForeground(0, QBrush(QColor(fg)))
             self.tree.addTopLevelItem(root)
             roots[action] = root
             for item in sorted(items, key=lambda x: x.target_path.as_posix().casefold()):
                 rel = item.target_path.relative_to(
                     self.project_root).as_posix()
-                child = QTreeWidgetItem([rel, f"{item.size:,} B"])
+                child = QTreeWidgetItem(
+                    [rel, action_label, f"{item.size:,} B"])
                 child.setData(0, Qt.ItemDataRole.UserRole, item)
                 child.setToolTip(0, rel)
+                child.setForeground(1, QBrush(QColor(fg)))
                 if item.action != "unchanged":
                     child.setFlags(
                         child.flags()
@@ -353,21 +492,22 @@ class ImportPreviewDialog(QDialog):
         if not isinstance(item, ImportItem):
             return
         rel = item.target_path.relative_to(self.project_root).as_posix()
+        label = "MODIFIED" if item.action == "replace" else "NEW" if item.action == "new" else "UNCHANGED"
         self.diff_title.setText(
-            f"<b>{item.action.upper()}</b>  ·  {rel}  ·  {item.size:,} bytes")
+            f"<b>{label}</b>  ·  {rel}  ·  {item.size:,} bytes")
         try:
             new_data = self._zip.read(item.archive_path)
             old_data = item.target_path.read_bytes() if item.target_path.exists(
             ) and item.target_path.is_file() else b""
         except OSError as exc:
-            self.diff.setPlainText(f"Unable to read file for preview:\n{exc}")
+            self.diff.show_diff(f"Unable to read file for preview:\n{exc}")
             return
         old_text = self._decode(old_data)
         new_text = self._decode(new_data)
         if old_text is None or new_text is None:
             same = old_data == new_data
-            self.diff.setPlainText(
-                "Binary file. Content is " + ("unchanged." if same else "different."))
+            self.diff.show_diff("Binary file. Content is " +
+                                ("unchanged." if same else "different."))
             return
         diff = difflib.unified_diff(
             old_text.splitlines(),
@@ -377,7 +517,7 @@ class ImportPreviewDialog(QDialog):
             lineterm="",
         )
         text = "\n".join(diff)
-        self.diff.setPlainText(text or "No textual differences.")
+        self.diff.show_diff(text or "No textual differences.")
 
     @staticmethod
     def _decode(data: bytes):

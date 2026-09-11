@@ -7,7 +7,7 @@ from PySide6.QtGui import QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
     QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
     QMessageBox, QPushButton, QVBoxLayout, QWidget, QListWidget, QListWidgetItem,
-    QDialog, QProgressBar, QGroupBox,
+    QDialog, QProgressBar, QAbstractItemView, QScrollBar,
 )
 
 from core.importer import apply_import, enrich_plan_hashes, history_entry, make_plan, undo_import
@@ -119,180 +119,251 @@ class MainWindow(QMainWindow):
         root = QWidget()
         self.setCentralWidget(root)
         layout = QVBoxLayout(root)
-        layout.setContentsMargins(28, 24, 28, 24)
-        layout.setSpacing(16)
+        layout.setContentsMargins(30, 26, 30, 26)
+        layout.setSpacing(18)
 
-        # Header
         header = QHBoxLayout()
+        header.setSpacing(16)
         title_block = QVBoxLayout()
-        title_block.setSpacing(2)
+        title_block.setSpacing(3)
         title = QLabel("LLM Drop-In")
         title.setObjectName("WindowTitle")
         subtitle = QLabel(
-            "Safely review and apply files from LLM-generated ZIP archives")
+            "Review generated changes before they touch your project.")
         subtitle.setObjectName("WindowSubtitle")
         title_block.addWidget(title)
         title_block.addWidget(subtitle)
         header.addLayout(title_block, 1)
-        self.status_badge = QLabel("Ready")
-        self.status_badge.setObjectName("StatusBadge")
-        self.status_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        header.addWidget(self.status_badge, 0, Qt.AlignmentFlag.AlignTop)
         layout.addLayout(header)
 
-        # Project section
-        project_group = QGroupBox("Project")
-        project_layout = QVBoxLayout(project_group)
-        project_layout.setContentsMargins(16, 18, 16, 16)
-        project_layout.setSpacing(9)
+        body = QWidget()
+        body_layout = QHBoxLayout(body)
+        body_layout.setContentsMargins(0, 0, 0, 0)
+        body_layout.setSpacing(16)
 
+        main_column = QVBoxLayout()
+        main_column.setContentsMargins(0, 0, 0, 0)
+        main_column.setSpacing(14)
+
+        project_card = QFrame()
+        project_card.setObjectName("SectionCard")
+        project_layout = QVBoxLayout(project_card)
+        project_layout.setContentsMargins(18, 16, 18, 16)
+        project_layout.setSpacing(10)
+        project_header = QHBoxLayout()
+        project_title = QLabel("Project")
+        project_title.setObjectName("CardTitle")
+        project_header.addWidget(project_title)
+        project_header.addStretch()
+        project_hint = QLabel("The ZIP is matched against this folder.")
+        project_hint.setObjectName("CardHint")
+        project_header.addWidget(project_hint)
+        project_layout.addLayout(project_header)
         project_row = QHBoxLayout()
+        project_row.setSpacing(10)
         self.project_edit = QLineEdit()
         self.project_edit.setReadOnly(True)
         self.project_edit.setPlaceholderText("No project selected")
-        self.project_edit.setMinimumHeight(38)
+        self.project_edit.setMinimumHeight(40)
         project_row.addWidget(self.project_edit, 1)
-
         choose = QPushButton("Choose folder")
         choose.setObjectName("SecondaryButton")
-        choose.setMinimumHeight(38)
+        choose.setMinimumHeight(40)
         choose.clicked.connect(self.choose_project)
         project_row.addWidget(choose)
         project_layout.addLayout(project_row)
+        main_column.addWidget(project_card)
 
-        project_hint = QLabel(
-            "The selected folder is the root that ZIP contents will be matched against.")
-        project_hint.setObjectName("SectionHint")
-        project_layout.addWidget(project_hint)
-        layout.addWidget(project_group)
-
-        # Import section
-        import_group = QGroupBox("Import")
-        import_layout = QVBoxLayout(import_group)
-        import_layout.setContentsMargins(16, 18, 16, 16)
+        import_card = QFrame()
+        import_card.setObjectName("SectionCard")
+        import_layout = QVBoxLayout(import_card)
+        import_layout.setContentsMargins(18, 16, 18, 16)
         import_layout.setSpacing(10)
-
+        import_header = QHBoxLayout()
+        import_title = QLabel("Import")
+        import_title.setObjectName("CardTitle")
+        import_header.addWidget(import_title)
+        import_header.addStretch()
+        import_hint = QLabel(
+            "Drop a ZIP to inspect it before applying anything.")
+        import_hint.setObjectName("CardHint")
+        import_header.addWidget(import_hint)
+        import_layout.addLayout(import_header)
         self.drop = DropArea(self.receive_zip)
-        self.drop.setMinimumHeight(190)
+        self.drop.setMinimumHeight(220)
         import_layout.addWidget(self.drop)
+        main_column.addWidget(import_card, 1)
 
-        progress_row = QHBoxLayout()
+        status_bar = QFrame()
+        status_bar.setObjectName("AppStatusBar")
+        status_layout = QHBoxLayout(status_bar)
+        status_layout.setContentsMargins(2, 2, 2, 0)
+        status_layout.setSpacing(9)
+        self.status_dot = QLabel("●")
+        self.status_dot.setObjectName("StatusDot")
+        status_layout.addWidget(self.status_dot)
+        self.status = QLabel("Select a project folder to get started.")
+        self.status.setObjectName("AppStatus")
+        self.status.setWordWrap(True)
+        status_layout.addWidget(self.status, 1)
         self.progress = QProgressBar()
         self.progress.setRange(0, 0)
-        self.progress.setFixedHeight(6)
+        self.progress.setFixedHeight(4)
         self.progress.setTextVisible(False)
+        self.progress.setMaximumWidth(170)
         self.progress.hide()
-        progress_row.addWidget(self.progress, 1)
-        self.status = QLabel("Select a project to get started.")
-        self.status.setObjectName("InlineStatus")
-        progress_row.addWidget(self.status, 0, Qt.AlignmentFlag.AlignRight)
-        import_layout.addLayout(progress_row)
-        layout.addWidget(import_group)
+        status_layout.addWidget(self.progress)
+        main_column.addWidget(status_bar)
 
-        # History section
-        history_group = QGroupBox("Recent imports")
-        history_layout = QVBoxLayout(history_group)
-        history_layout.setContentsMargins(16, 18, 16, 16)
-        history_layout.setSpacing(9)
+        history_card = QFrame()
+        history_card.setObjectName("HistorySidebar")
+        history_card.setMinimumWidth(290)
+        history_card.setMaximumWidth(360)
+        history_layout = QVBoxLayout(history_card)
+        history_layout.setContentsMargins(16, 16, 16, 14)
+        history_layout.setSpacing(10)
+
+        history_header = QVBoxLayout()
+        history_header.setSpacing(2)
+        history_title = QLabel("Recent imports")
+        history_title.setObjectName("CardTitle")
+        history_header.addWidget(history_title)
+        history_hint = QLabel(
+            "Select an import to inspect its status.")
+        history_hint.setObjectName("CardHint")
+        history_hint.setWordWrap(True)
+        history_header.addWidget(history_hint)
+        history_layout.addLayout(history_header)
 
         self.history = QListWidget()
         self.history.itemSelectionChanged.connect(
             self._history_selection_changed)
-        self.history.itemDoubleClicked.connect(self._undo_history_item)
-        self.history.setMinimumHeight(150)
+        # Double-click intentionally has no destructive action.
+        self.history.setFrameShape(QFrame.Shape.NoFrame)
         self.history.setAlternatingRowColors(False)
+        self.history.setVerticalScrollMode(
+            QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.history.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.history.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.history.setUniformItemSizes(False)
         history_layout.addWidget(self.history, 1)
 
-        history_footer = QHBoxLayout()
-        history_hint = QLabel(
-            "Double-click an import to undo it, or select one and use the button.")
-        history_hint.setObjectName("SectionHint")
-        history_footer.addWidget(history_hint, 1)
-        self.undo = QPushButton("Undo selected")
+        self.history_summary = QLabel("No imports yet")
+        self.history_summary.setObjectName("HistorySummary")
+        history_layout.addWidget(self.history_summary)
+
+        self.undo = QPushButton("Undo selected import")
         self.undo.setObjectName("SecondaryButton")
+        self.undo.setMinimumHeight(38)
         self.undo.setEnabled(False)
         self.undo.clicked.connect(self._undo_history_item)
-        history_footer.addWidget(self.undo)
-        history_layout.addLayout(history_footer)
-        layout.addWidget(history_group, 1)
+        history_layout.addWidget(self.undo)
 
-        self.setStyleSheet('''
-            QMainWindow { background: #f3f5f7; }
-            QWidget { color: #20252b; font-size: 10pt; }
-            QGroupBox {
+        body_layout.addLayout(main_column, 1)
+        body_layout.addWidget(history_card, 0)
+        layout.addWidget(body, 1)
+
+        self.setStyleSheet("""
+            QMainWindow { background: #f4f6f7; }
+            QWidget { color: #1f272d; font-size: 10pt; }
+            QFrame#SectionCard, QFrame#HistorySidebar {
                 background: #ffffff;
-                border: 1px solid #dfe3e8;
-                border-radius: 12px;
-                margin-top: 9px;
-                padding-top: 7px;
-                font-weight: 600;
+                border: 1px solid #dce2e5;
+                border-radius: 13px;
             }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 14px;
-                padding: 0 5px;
-                color: #3b434c;
+            QFrame#HistorySidebar {
+                min-width: 290px;
             }
-            QLabel#WindowTitle { font-size: 21pt; font-weight: 700; color: #171b20; }
-            QLabel#WindowSubtitle { color: #707780; font-size: 10pt; }
-            QLabel#SectionHint, QLabel#DropHint { color: #737b84; }
-            QLabel#InlineStatus { color: #59616a; padding-left: 8px; }
-            QLabel#StatusBadge {
-                background: #eaf5ef;
-                color: #23633f;
-                border-radius: 999px;
-                padding: 6px 12px;
-                font-weight: 600;
-            }
-            QLineEdit, QListWidget {
-                background: #fbfcfd;
-                border: 1px solid #d8dde3;
+            QLabel#WindowTitle { font-size: 22pt; font-weight: 700; color: #172027; }
+            QLabel#WindowSubtitle { color: #707a82; font-size: 10pt; }
+            QLabel#CardTitle { font-size: 11pt; font-weight: 700; color: #273238; }
+            QLabel#CardHint, QLabel#DropHint { color: #778188; }
+            QLabel#InlineStatus { color: #4f5b61; }
+            QLabel#HistorySummary { color: #7a848b; }
+            QLabel#StatusDot { color: #4b967f; font-size: 8pt; }
+            QLabel#AppStatus { color: #5d676e; }
+            QFrame#AppStatusBar { background: transparent; }
+            QLineEdit {
+                background: #fbfcfc;
+                border: 1px solid #d5dde0;
                 border-radius: 8px;
-                padding: 7px 9px;
-                selection-background-color: #dff1ec;
-                selection-color: #16221f;
+                padding: 7px 10px;
+                selection-background-color: #dcefe9;
+                selection-color: #17211f;
             }
-            QLineEdit:focus, QListWidget:focus { border: 1px solid #79a89b; }
+            QLineEdit:focus { border: 1px solid #6d9f93; }
             QPushButton {
                 background: #276b5f;
                 color: white;
                 border: none;
                 border-radius: 8px;
                 padding: 8px 14px;
-                font-weight: 600;
+                font-weight: 700;
             }
             QPushButton:hover { background: #215b51; }
             QPushButton:pressed { background: #1b4e46; }
             QPushButton:disabled { background: #d9dddf; color: #8a9298; }
-            QPushButton#SecondaryButton { background: #eef1f3; color: #30373d; border: 1px solid #d7dce0; }
-            QPushButton#SecondaryButton:hover { background: #e4e8eb; }
+            QPushButton#SecondaryButton {
+                background: #f0f3f4;
+                color: #30393f;
+                border: 1px solid #d6dde0;
+            }
+            QPushButton#SecondaryButton:hover { background: #e7ebed; }
             QFrame#DropArea {
                 background: #fbfdfc;
-                border: 2px dashed #9ab9b0;
+                border: 1.5px dashed #8eb8ad;
                 border-radius: 12px;
             }
-            QFrame#DropArea:hover { background: #f2faf7; border-color: #5d9588; }
-            QLabel#DropTitle { font-size: 13pt; font-weight: 700; color: #2d554d; }
-            QListWidget::item { padding: 8px 6px; border-bottom: 1px solid #edf0f2; }
-            QListWidget::item:selected { background: #e8f3f0; border-radius: 6px; }
+            QFrame#DropArea:hover { background: #f3faf8; border-color: #5d9588; }
+            QLabel#DropTitle { font-size: 13pt; font-weight: 700; color: #2d6256; }
+            QListWidget {
+                background: #fbfcfc;
+                border: 1px solid #e1e6e8;
+                border-radius: 9px;
+                padding: 2px;
+                outline: none;
+            }
+            QListWidget::item {
+                padding: 10px 9px;
+                border-bottom: 1px solid #edf0f1;
+            }
+            QListWidget::item:selected {
+                background: #e8f3f0;
+                color: #17211f;
+                border-radius: 6px;
+            }
+            QScrollBar:vertical {
+                background: #f3f5f6;
+                width: 12px;
+                margin: 3px 2px 3px 2px;
+                border-radius: 6px;
+            }
+            QScrollBar::handle:vertical {
+                background: #b4c2c7;
+                min-height: 24px;
+                border-radius: 6px;
+            }
+            QScrollBar::handle:vertical:hover { background: #95a6ad; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical,
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+                background: none;
+                border: none;
+                height: 0px;
+            }
             QProgressBar { background: transparent; border: none; border-radius: 3px; }
-            QProgressBar::chunk { background: #5e9b8d; border-radius: 3px; }
-        ''')
+            QProgressBar::chunk { background: #5b9a8b; border-radius: 3px; }
+        """)
 
     def _set_status(self, text: str, *, active: bool = False, error: bool = False):
         self.status.setText(text)
         if error:
-            self.status_badge.setText("Error")
-            self.status_badge.setStyleSheet(
-                "background:#fbeaea;color:#9a3636;border-radius:999px;padding:6px 12px;font-weight:600;")
+            self.status_dot.setStyleSheet("color:#bd5a5a;font-size:8pt;")
         elif active:
-            self.status_badge.setText("Working")
-            self.status_badge.setStyleSheet(
-                "background:#edf2fa;color:#3e5d87;border-radius:999px;padding:6px 12px;font-weight:600;")
+            self.status_dot.setStyleSheet("color:#6b8fb2;font-size:8pt;")
         else:
-            self.status_badge.setText("Ready")
-            self.status_badge.setStyleSheet(
-                "background:#eaf5ef;color:#23633f;border-radius:999px;padding:6px 12px;font-weight:600;")
+            self.status_dot.setStyleSheet("color:#4b967f;font-size:8pt;")
 
     def _refresh(self):
         if self.project and self.project.exists() and self.project.is_dir():
@@ -305,7 +376,12 @@ class MainWindow(QMainWindow):
             if not self.progress.isVisible():
                 self._set_status("Select a project folder to get started.")
         self.history.clear()
-        for entry in load_history()[:15]:
+        entries = load_history()[:15]
+        self.history_summary.setText(
+            f"{len(entries)} recent import{'s' if len(entries) != 1 else ''}"
+            if entries else "No imports yet"
+        )
+        for entry in entries:
             ts = entry.get("timestamp", "").replace("T", " ")
             name = Path(entry.get("zip", "")).name
             counts = (
@@ -456,10 +532,10 @@ class MainWindow(QMainWindow):
         self._pending_zip = None
         self._pending_plan = None
 
-    def _undo_history_item(self, item=None):
+    def _undo_history_item(self):
         if self.worker_thread is not None:
             return
-        row = item if item is not None else self.history.currentItem()
+        row = self.history.currentItem()
         if row is None:
             return
         entry = row.data(Qt.ItemDataRole.UserRole)
