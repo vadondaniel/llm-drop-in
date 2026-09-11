@@ -7,7 +7,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QDialog, QDialogButtonBox, QHBoxLayout, QLabel, QListWidget,
     QListWidgetItem, QVBoxLayout, QCheckBox, QPlainTextEdit, QSplitter,
-    QWidget,
+    QWidget, QFrame,
 )
 
 from core.importer import ImportItem
@@ -16,8 +16,9 @@ from core.importer import ImportItem
 class ImportPreviewDialog(QDialog):
     def __init__(self, project_root, project_name: str, prefix: str, plan: list[ImportItem], zip_path, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Import preview")
-        self.resize(1100, 700)
+        self.setWindowTitle("Review import")
+        self.resize(1160, 740)
+        self.setMinimumSize(900, 620)
         self.project_root = project_root
         self.plan = plan
         self.zip_path = zip_path
@@ -25,45 +26,76 @@ class ImportPreviewDialog(QDialog):
         self._zip = zipfile.ZipFile(zip_path)
 
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel(f"<h3>{project_name}</h3>"))
-        prefix_text = prefix[:-1] if prefix.endswith("/") else prefix
-        layout.addWidget(
-            QLabel(f"Detected ZIP root: <code>{prefix_text or '(archive root)'}</code>"))
+        layout.setContentsMargins(22, 20, 22, 20)
+        layout.setSpacing(13)
 
+        heading = QHBoxLayout()
+        title_block = QVBoxLayout()
+        title_block.setSpacing(2)
+        title = QLabel("Review import")
+        title.setObjectName("PreviewTitle")
+        subtitle = QLabel(f"{project_name}  ·  {zip_path.name}")
+        subtitle.setObjectName("PreviewSubtitle")
+        title_block.addWidget(title)
+        title_block.addWidget(subtitle)
+        heading.addLayout(title_block, 1)
+        layout.addLayout(heading)
+
+        prefix_frame = QFrame()
+        prefix_frame.setObjectName("InfoCard")
+        prefix_layout = QVBoxLayout(prefix_frame)
+        prefix_layout.setContentsMargins(12, 10, 12, 10)
+        prefix_text = prefix[:-1] if prefix.endswith("/") else prefix
+        prefix_layout.addWidget(
+            QLabel(f"<b>Detected ZIP root:</b> {prefix_text or '(archive root)'}"))
         replace = sum(x.action == "replace" for x in plan)
         new = sum(x.action == "new" for x in plan)
         unchanged = sum(x.action == "unchanged" for x in plan)
-        layout.addWidget(QLabel(
-            f"{len(plan)} files: {replace} modified, {new} new, {unchanged} unchanged. Nothing will be deleted."
-        ))
+        summary = QLabel(
+            f"<b>{len(plan)}</b> files · <b>{replace}</b> modified · <b>{new}</b> new · <b>{unchanged}</b> unchanged · nothing will be deleted")
+        summary.setObjectName("SummaryText")
+        prefix_layout.addWidget(summary)
+        layout.addWidget(prefix_frame)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 6, 0)
+        left_layout.setSpacing(7)
+        left_layout.addWidget(QLabel("Files to import"))
+
         self.list = QListWidget()
         self.list.currentItemChanged.connect(self._show_diff)
         for item in plan:
             checkbox = QCheckBox()
             checkbox.setChecked(item.action != "unchanged")
             rel = item.target_path.relative_to(project_root).as_posix()
-            text = f"{item.action.upper():9}  {rel}"
+            text = f"{item.action.upper()}   {rel}"
             row = QListWidgetItem()
             self.list.addItem(row)
             row.setData(Qt.ItemDataRole.UserRole, item)
             widget = self._row_widget(checkbox, text)
             self.list.setItemWidget(row, widget)
             row.setSizeHint(widget.sizeHint())
-            checkbox.item = item  # type: ignore[attr-defined]
-        splitter.addWidget(self.list)
+        left_layout.addWidget(self.list, 1)
+        splitter.addWidget(left)
 
         right = QWidget()
         right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(6, 0, 0, 0)
+        right_layout.setSpacing(7)
         self.diff_title = QLabel("Select a file to inspect its changes")
+        self.diff_title.setObjectName("DiffTitle")
         right_layout.addWidget(self.diff_title)
         self.diff = QPlainTextEdit()
         self.diff.setReadOnly(True)
         self.diff.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.diff.setPlaceholderText("A file diff will appear here.")
         right_layout.addWidget(self.diff, 1)
         splitter.addWidget(right)
-        splitter.setSizes([420, 680])
+        splitter.setSizes([460, 700])
         layout.addWidget(splitter, 1)
 
         controls = QHBoxLayout()
@@ -82,6 +114,37 @@ class ImportPreviewDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
+        self.setStyleSheet('''
+            QDialog { background: #f3f5f7; }
+            QWidget { color: #20252b; font-size: 10pt; }
+            QLabel#PreviewTitle { font-size: 19pt; font-weight: 700; color: #171b20; }
+            QLabel#PreviewSubtitle { color: #707780; }
+            QFrame#InfoCard {
+                background: #ffffff;
+                border: 1px solid #dfe3e8;
+                border-radius: 10px;
+            }
+            QLabel#SummaryText { color: #59616a; }
+            QListWidget, QPlainTextEdit {
+                background: #ffffff;
+                border: 1px solid #d8dde3;
+                border-radius: 9px;
+                padding: 5px;
+            }
+            QListWidget::item { padding: 6px; border-bottom: 1px solid #edf0f2; }
+            QListWidget::item:selected { background: #e8f3f0; border-radius: 6px; }
+            QLabel#DiffTitle { background:#ffffff; border:1px solid #dfe3e8; border-radius:8px; padding:8px 10px; }
+            QPushButton {
+                background: #276b5f;
+                color: white;
+                border: none;
+                border-radius: 8px;
+                padding: 8px 14px;
+                font-weight: 600;
+            }
+            QPushButton:hover { background: #215b51; }
+        ''')
+
         if self.list.count():
             self.list.setCurrentRow(0)
 
@@ -89,7 +152,8 @@ class ImportPreviewDialog(QDialog):
     def _row_widget(checkbox, text):
         widget = QWidget()
         row = QHBoxLayout(widget)
-        row.setContentsMargins(4, 2, 4, 2)
+        row.setContentsMargins(4, 1, 4, 1)
+        row.setSpacing(7)
         row.addWidget(checkbox)
         label = QLabel(text)
         label.setTextInteractionFlags(
@@ -117,7 +181,7 @@ class ImportPreviewDialog(QDialog):
             return
         rel = item.target_path.relative_to(self.project_root).as_posix()
         self.diff_title.setText(
-            f"<b>{item.action.upper()}</b> · {rel} · {item.size:,} bytes")
+            f"<b>{item.action.upper()}</b>  ·  {rel}  ·  {item.size:,} bytes")
         try:
             new_data = self._zip.read(item.archive_path)
             old_data = item.target_path.read_bytes() if item.target_path.exists(
