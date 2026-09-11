@@ -8,11 +8,16 @@ A small PySide6 Windows utility for dropping LLM-generated ZIPs onto a selected 
 - Drag/drop a ZIP or choose one from a file dialog.
 - Detect common extra wrapper directories automatically.
 - Match ZIP files to the selected project without flattening paths.
-- Preview replacements/new files before applying.
+- Preview modified/new/unchanged files before applying.
+- Select individual files to import.
+- Detect duplicate/case-colliding archive paths and unsafe Windows paths.
+- Detect suspiciously large/compressed archives before extraction.
+- Stage and verify every file before committing an import.
+- Roll back already-committed files if a commit fails.
+- Skip unchanged files rather than rewriting them.
 - Never delete project files merely because they are absent from the ZIP.
-- Remove Windows Mark-of-the-Web (`Zone.Identifier`) from imported files.
 - Keep a local import history.
-- Reject ambiguous paths instead of guessing.
+- Run archive analysis in a worker thread so the UI stays responsive.
 
 ## Requirements
 
@@ -30,6 +35,12 @@ Run:
 
 ```powershell
 py main.py
+```
+
+Run tests:
+
+```powershell
+py -m unittest discover -s core -p "test_*.py"
 ```
 
 ## Optional build
