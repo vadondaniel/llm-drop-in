@@ -128,8 +128,62 @@ def _validate_current_state(effective_plan: list[ImportItem]) -> None:
                 )
 
 
-def apply_import(zip_path: Path, plan: list[ImportItem], prefix: str | None = None, project_root: Path | None = None) -> tuple[int, str | None]:
-    """Apply an import transactionally and retain an undo record on success."""
+def _transaction_dir(transaction_id: str) -> Path:
+    return TRANSACTION_DIR / transaction_id
+
+
+def _read_transaction_manifest(transaction_dir: Path) -> dict | None:
+    manifest_path = transaction_dir / "manifest.json"
+    if not manifest_path.is_file():
+        return None
+    try:
+        return json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _cleanup_transaction_files(manifest: dict | None) -> None:
+    if not manifest:
+        return
+    for item in manifest.get("files", []):
+        for key in ("backup", "staged"):
+            raw = item.get(key)
+            if not raw:
+                continue
+            try:
+                Path(raw).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def cleanup_orphaned_transactions(active_ids: set[str] | None = None) -> int:
+    """Remove transaction data no longer referenced by import history.
+
+    Transaction backups are owned by the corresponding history entry. This
+    keeps project-side .bak files from accumulating forever while preserving
+    explicit undo for retained history entries.
+    """
+    active_ids = active_ids or set()
+    if not TRANSACTION_DIR.is_dir():
+        return 0
+    removed = 0
+    for transaction_dir in TRANSACTION_DIR.iterdir():
+        if not transaction_dir.is_dir() or transaction_dir.name in active_ids:
+            continue
+        manifest = _read_transaction_manifest(transaction_dir)
+        _cleanup_transaction_files(manifest)
+        shutil.rmtree(transaction_dir, ignore_errors=True)
+        removed += 1
+    return removed
+
+
+def apply_import(
+    zip_path: Path,
+    plan: list[ImportItem],
+    prefix: str | None = None,
+    project_root: Path | None = None,
+) -> tuple[int, str | None]:
+    """Apply an import and retain only the undo state needed by history."""
     effective_plan = [item for item in plan if item.action != "unchanged"]
     if not effective_plan:
         return 0, None
@@ -137,19 +191,28 @@ def apply_import(zip_path: Path, plan: list[ImportItem], prefix: str | None = No
     _validate_current_state(effective_plan)
     TRANSACTION_DIR.mkdir(parents=True, exist_ok=True)
     transaction_id = datetime.now().strftime("%Y%m%d%H%M%S%f")
-    transaction_dir = TRANSACTION_DIR / transaction_id
+    transaction_dir = _transaction_dir(transaction_id)
     transaction_dir.mkdir()
     committed: list[tuple[Path, Path | None]] = []
     staged_files: list[Path] = []
     backup_files: list[Path] = []
 
+    manifest = {
+        "id": transaction_id,
+        "zip": str(zip_path),
+        "project": str(project_root.resolve()) if project_root else None,
+        "files": [],
+    }
+    manifest_path = transaction_dir / "manifest.json"
+
+    def save_manifest() -> None:
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2), encoding="utf-8"
+        )
+
     try:
         with zipfile.ZipFile(zip_path) as zf:
             for index, item in enumerate(effective_plan):
-                # os.replace() requires source and destination to live on the
-                # same filesystem on Windows.  The app-level transaction
-                # directory normally lives on C:, while projects may live on
-                # another drive.  Stage beside the real destination instead.
                 target = item.target_path
                 target.parent.mkdir(parents=True, exist_ok=True)
                 staged = target.parent / (
@@ -163,14 +226,16 @@ def apply_import(zip_path: Path, plan: list[ImportItem], prefix: str | None = No
                 if item.new_hash and staged_hash != item.new_hash:
                     raise ValueError(
                         f"Verification failed for {item.archive_path}")
+                manifest["files"].append({
+                    "target": str(target),
+                    "backup": None,
+                    "staged": str(staged),
+                    "old_hash": item.old_hash,
+                    "new_hash": item.new_hash,
+                })
+        save_manifest()
 
         _validate_current_state(effective_plan)
-        manifest = {
-            "id": transaction_id,
-            "zip": str(zip_path),
-            "project": str(project_root.resolve()) if project_root else None,
-            "files": [],
-        }
 
         for index, item in enumerate(effective_plan):
             target = item.target_path
@@ -180,28 +245,20 @@ def apply_import(zip_path: Path, plan: list[ImportItem], prefix: str | None = No
                 if not target.is_file() or target.is_symlink():
                     raise ValueError(
                         f"Refusing to replace non-regular file: {target}")
-                backup = target.parent / (
-                    f".{target.name}.llm-dropin-{transaction_id}-{index:08d}.bak"
-                )
+                backup = transaction_dir / \
+                    f"backup-{index:08d}{target.suffix}.bak"
                 backup_files.append(backup)
                 shutil.copy2(target, backup)
-            staged = target.parent / (
-                f".{target.name}.llm-dropin-{transaction_id}-{index:08d}.tmp"
-            )
+            staged = Path(manifest["files"][index]["staged"])
             os.replace(staged, target)
             staged_files.remove(staged)
             unblock_file(target)
             committed.append((target, backup))
-            manifest["files"].append({
-                "target": str(target),
-                "backup": str(backup) if backup else None,
-                "old_hash": item.old_hash,
-                "new_hash": item.new_hash,
-            })
+            manifest["files"][index]["backup"] = str(
+                backup) if backup else None
+            manifest["files"][index]["staged"] = None
+            save_manifest()
 
-        (transaction_dir / "manifest.json").write_text(
-            json.dumps(manifest, indent=2), encoding="utf-8"
-        )
         return len(effective_plan), transaction_id
     except Exception:
         for target, backup in reversed(committed):
@@ -212,36 +269,44 @@ def apply_import(zip_path: Path, plan: list[ImportItem], prefix: str | None = No
                     target.unlink()
             except OSError:
                 pass
-        for path in (*staged_files, *backup_files):
-            try:
-                path.unlink(missing_ok=True)
-            except OSError:
-                pass
+        _cleanup_transaction_files(manifest)
         shutil.rmtree(transaction_dir, ignore_errors=True)
         raise
 
 
 def undo_import(transaction_id: str) -> int:
-    transaction_dir = TRANSACTION_DIR / transaction_id
-    manifest_path = transaction_dir / "manifest.json"
-    if not manifest_path.is_file():
+    transaction_dir = _transaction_dir(transaction_id)
+    manifest = _read_transaction_manifest(transaction_dir)
+    if manifest is None:
         raise ValueError("Import transaction no longer exists.")
-    import json
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
     restored = 0
-    for item in reversed(manifest.get("files", [])):
+    files = manifest.get("files", [])
+    for item in reversed(files):
         target = Path(item["target"])
         backup = Path(item["backup"]) if item.get("backup") else None
-        current = _hash_file(target) if target.exists(
-        ) and target.is_file() and not target.is_symlink() else None
+        current = (
+            _hash_file(target)
+            if target.exists() and target.is_file() and not target.is_symlink()
+            else None
+        )
         if current != item.get("new_hash"):
             raise RuntimeError(
-                f"Cannot undo because the file changed after import: {target}")
+                f"Cannot undo because the file changed after import: {target}"
+            )
         if backup is not None and backup.exists():
-            os.replace(backup, target)
+            restore_tmp = target.parent / (
+                f".{target.name}.llm-dropin-{transaction_id}-{files.index(item):08d}.tmp"
+            )
+            try:
+                shutil.copy2(backup, restore_tmp)
+                os.replace(restore_tmp, target)
+            finally:
+                restore_tmp.unlink(missing_ok=True)
         elif target.exists():
             target.unlink()
         restored += 1
+
     shutil.rmtree(transaction_dir, ignore_errors=True)
     return restored
 

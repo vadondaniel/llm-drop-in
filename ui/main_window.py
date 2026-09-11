@@ -7,11 +7,11 @@ from PySide6.QtGui import QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
     QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
     QMessageBox, QPushButton, QVBoxLayout, QWidget, QListWidget, QListWidgetItem,
-    QDialog, QProgressBar, QAbstractItemView, QScrollBar,
+    QDialog, QProgressBar, QAbstractItemView, QScrollBar, QComboBox,
 )
 
-from core.importer import apply_import, enrich_plan_hashes, history_entry, make_plan, undo_import
-from core.settings import add_history, load_history, load_settings, save_settings, update_history_entry
+from core.importer import apply_import, cleanup_orphaned_transactions, enrich_plan_hashes, history_entry, make_plan, undo_import
+from core.settings import add_history, load_history, load_settings, save_settings, update_history_entry, remember_project
 from core.zip_analyzer import analyze
 from ui.import_preview import ImportPreviewDialog
 
@@ -108,11 +108,69 @@ class MainWindow(QMainWindow):
         self.settings = load_settings()
         self.project = Path(self.settings.get("project", "")
                             ) if self.settings.get("project") else None
+        if not self._valid_project(self.project):
+            self.project = next((Path(value) for value in self.settings.get(
+                "recent_projects", []) if self._valid_project(Path(value))), None)
+            if self.project:
+                remember_project(self.settings, self.project)
+                save_settings(self.settings)
         self.worker_thread: QThread | None = None
         self.worker: QObject | None = None
         self._pending_zip: Path | None = None
         self._pending_plan = None
+        self._cleanup_stale_transactions()
         self._build()
+        self._refresh()
+
+    @staticmethod
+    def _valid_project(path: Path | None) -> bool:
+        return path is not None and path.exists() and path.is_dir()
+
+    def _refresh_recent_projects(self) -> None:
+        if not hasattr(self, "project_picker"):
+            return
+        project = self.project
+        current = ""
+        if project is not None and self._valid_project(project):
+            current = str(project.resolve())
+        values = []
+        seen = set()
+        for value in self.settings.get("recent_projects", []):
+            if not isinstance(value, str):
+                continue
+            path = Path(value)
+            if not self._valid_project(path):
+                continue
+            resolved = str(path.resolve())
+            key = resolved.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            values.append(resolved)
+        if current and current.casefold() not in seen:
+            values.insert(0, current)
+        self.project_picker.blockSignals(True)
+        self.project_picker.clear()
+        self.project_picker.addItems(values)
+        if current:
+            index = self.project_picker.findText(current)
+            if index >= 0:
+                self.project_picker.setCurrentIndex(index)
+        self.project_picker.blockSignals(False)
+
+    def _select_recent_project(self, index: int) -> None:
+        if index < 0:
+            return
+        value = self.project_picker.itemText(index)
+        if not value:
+            return
+        path = Path(value)
+        if not self._valid_project(path):
+            self._refresh_recent_projects()
+            return
+        self.project = path.resolve()
+        remember_project(self.settings, self.project)
+        save_settings(self.settings)
         self._refresh()
 
     def _build(self):
@@ -161,11 +219,12 @@ class MainWindow(QMainWindow):
         project_layout.addLayout(project_header)
         project_row = QHBoxLayout()
         project_row.setSpacing(10)
-        self.project_edit = QLineEdit()
-        self.project_edit.setReadOnly(True)
-        self.project_edit.setPlaceholderText("No project selected")
-        self.project_edit.setMinimumHeight(40)
-        project_row.addWidget(self.project_edit, 1)
+        self.project_picker = QComboBox()
+        self.project_picker.setMinimumHeight(40)
+        self.project_picker.setPlaceholderText("No recent project")
+        self.project_picker.currentIndexChanged.connect(
+            self._select_recent_project)
+        project_row.addWidget(self.project_picker, 1)
         choose = QPushButton("Choose folder")
         choose.setObjectName("SecondaryButton")
         choose.setMinimumHeight(40)
@@ -173,6 +232,7 @@ class MainWindow(QMainWindow):
         project_row.addWidget(choose)
         project_layout.addLayout(project_row)
         main_column.addWidget(project_card)
+        self._refresh_recent_projects()
 
         import_card = QFrame()
         import_card.setObjectName("SectionCard")
@@ -229,7 +289,7 @@ class MainWindow(QMainWindow):
         history_title.setObjectName("CardTitle")
         history_header.addWidget(history_title)
         history_hint = QLabel(
-            "Select an import to inspect its status.")
+            "Imports for the current project.")
         history_hint.setObjectName("CardHint")
         history_hint.setWordWrap(True)
         history_header.addWidget(history_hint)
@@ -285,7 +345,7 @@ class MainWindow(QMainWindow):
             QLabel#StatusDot { color: #4b967f; font-size: 8pt; }
             QLabel#AppStatus { color: #5d676e; }
             QFrame#AppStatusBar { background: transparent; }
-            QLineEdit {
+            QLineEdit, QComboBox {
                 background: #fbfcfc;
                 border: 1px solid #d5dde0;
                 border-radius: 8px;
@@ -293,7 +353,15 @@ class MainWindow(QMainWindow):
                 selection-background-color: #dcefe9;
                 selection-color: #17211f;
             }
-            QLineEdit:focus { border: 1px solid #6d9f93; }
+            QLineEdit:focus, QComboBox:focus { border: 1px solid #6d9f93; }
+            QComboBox::drop-down { border: none; width: 28px; }
+            QComboBox QAbstractItemView {
+                background: #ffffff;
+                border: 1px solid #d5dde0;
+                selection-background-color: #e8f3f0;
+                selection-color: #17211f;
+                padding: 4px;
+            }
             QPushButton {
                 background: #276b5f;
                 color: white;
@@ -356,6 +424,40 @@ class MainWindow(QMainWindow):
             QProgressBar::chunk { background: #5b9a8b; border-radius: 3px; }
         """)
 
+    def _cleanup_stale_transactions(self):
+        history = load_history()
+        active_ids = {
+            entry.get("transaction_id")
+            for entry in history
+            if isinstance(entry, dict) and entry.get("transaction_id") and not entry.get("undone")
+        }
+        cleanup_orphaned_transactions({str(value)
+                                      for value in active_ids if value})
+
+    def _current_project_key(self) -> str | None:
+        if self.project is None or not self._valid_project(self.project):
+            return None
+        return str(self.project.resolve()).casefold()
+
+    def _history_for_current_project(self) -> list[dict]:
+        project_key = self._current_project_key()
+        if project_key is None:
+            return []
+        result = []
+        for entry in load_history():
+            if not isinstance(entry, dict):
+                continue
+            raw_project = entry.get("project")
+            if not isinstance(raw_project, str) or not raw_project:
+                continue
+            try:
+                entry_key = str(Path(raw_project).resolve()).casefold()
+            except OSError:
+                continue
+            if entry_key == project_key:
+                result.append(entry)
+        return result
+
     def _set_status(self, text: str, *, active: bool = False, error: bool = False):
         self.status.setText(text)
         if error:
@@ -367,19 +469,20 @@ class MainWindow(QMainWindow):
 
     def _refresh(self):
         if self.project and self.project.exists() and self.project.is_dir():
-            self.project_edit.setText(str(self.project))
+            self._refresh_recent_projects()
             if not self.progress.isVisible():
                 self._set_status("Ready")
         else:
             self.project = None
-            self.project_edit.setText("")
+            self._refresh_recent_projects()
             if not self.progress.isVisible():
                 self._set_status("Select a project folder to get started.")
         self.history.clear()
-        entries = load_history()[:15]
+        entries = self._history_for_current_project()[:15]
         self.history_summary.setText(
             f"{len(entries)} recent import{'s' if len(entries) != 1 else ''}"
-            if entries else "No imports yet"
+            if entries
+            else ("No imports for this project" if self.project else "No project selected")
         )
         for entry in entries:
             ts = entry.get("timestamp", "").replace("T", " ")
@@ -412,9 +515,10 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
-        self.project = Path(path)
-        self.settings["project"] = str(self.project)
+        self.project = Path(path).resolve()
+        remember_project(self.settings, self.project)
         save_settings(self.settings)
+        self._refresh_recent_projects()
         self._refresh()
 
     def receive_zip(self, path: Path | None):
@@ -527,6 +631,7 @@ class MainWindow(QMainWindow):
         if path and self.project:
             add_history(history_entry(path, self.project,
                         plan, transaction_id=transaction_id))
+            self._cleanup_stale_transactions()
             self._refresh()
             self._set_status(f"Imported {applied} files from {path.name}")
         self._pending_zip = None
@@ -557,6 +662,7 @@ class MainWindow(QMainWindow):
             self._set_status("Undo failed", error=True)
             return
         update_history_entry(entry.get("id", ""), undone=True)
+        self._cleanup_stale_transactions()
         self._refresh()
         self._set_status(f"Undid import: restored {restored} files")
 

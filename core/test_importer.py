@@ -7,6 +7,7 @@ import zipfile
 from pathlib import Path
 
 from core.importer import apply_import, enrich_plan_hashes, make_plan, undo_import
+from core.settings import TRANSACTION_DIR, remember_project
 from core.zip_analyzer import analyze
 
 
@@ -144,3 +145,48 @@ class ImporterTests(unittest.TestCase):
             self.assertEqual(
                 (root / "existing.txt").read_text(encoding="utf-8"), "old")
             self.assertFalse((root / "new.txt").exists())
+
+    def test_recent_projects_move_to_front_and_dedupe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            first = Path(tmp) / "first"
+            second = Path(tmp) / "second"
+            first.mkdir()
+            second.mkdir()
+            settings = {"project": "", "recent_projects": []}
+            remember_project(settings, first)
+            remember_project(settings, second)
+            remember_project(settings, first)
+            self.assertEqual(
+                settings["recent_projects"],
+                [str(first.resolve()), str(second.resolve())],
+            )
+            self.assertEqual(settings["project"], str(first.resolve()))
+
+    def test_transaction_backup_cleanup_removes_unreferenced_backup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            existing = root / "existing.txt"
+            existing.write_text("old", encoding="utf-8")
+            zip_path = Path(tmp) / "update.zip"
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr("existing.txt", "new")
+            entries, candidates = analyze(zip_path, root)
+            plan = enrich_plan_hashes(
+                zip_path, make_plan(entries, candidates[0].prefix, root)
+            )
+            applied, transaction_id = apply_import(
+                zip_path, plan, project_root=root)
+            self.assertEqual(applied, 1)
+            assert transaction_id is not None
+            tx_dir = TRANSACTION_DIR / transaction_id
+            self.assertTrue(tx_dir.is_dir())
+            backup_files = list(root.glob("*.llm-dropin-*.bak"))
+            self.assertEqual(backup_files, [])
+            backup_files = list(tx_dir.glob("*.bak"))
+            self.assertEqual(len(backup_files), 1)
+
+            from core.importer import cleanup_orphaned_transactions
+            cleanup_orphaned_transactions(set())
+            self.assertFalse(tx_dir.exists())
+            self.assertFalse(backup_files[0].exists())
