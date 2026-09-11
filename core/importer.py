@@ -138,20 +138,27 @@ def apply_import(zip_path: Path, plan: list[ImportItem], prefix: str | None = No
     TRANSACTION_DIR.mkdir(parents=True, exist_ok=True)
     transaction_id = datetime.now().strftime("%Y%m%d%H%M%S%f")
     transaction_dir = TRANSACTION_DIR / transaction_id
-    staging_dir = transaction_dir / "staged"
-    backup_dir = transaction_dir / "backups"
     transaction_dir.mkdir()
-    staging_dir.mkdir()
-    backup_dir.mkdir()
     committed: list[tuple[Path, Path | None]] = []
+    staged_files: list[Path] = []
+    backup_files: list[Path] = []
 
     try:
         with zipfile.ZipFile(zip_path) as zf:
             for index, item in enumerate(effective_plan):
-                staged = staging_dir / f"{index:08d}.file"
+                # os.replace() requires source and destination to live on the
+                # same filesystem on Windows.  The app-level transaction
+                # directory normally lives on C:, while projects may live on
+                # another drive.  Stage beside the real destination instead.
+                target = item.target_path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                staged = target.parent / (
+                    f".{target.name}.llm-dropin-{transaction_id}-{index:08d}.tmp"
+                )
                 with zf.open(item.archive_path, "r") as src, staged.open("wb") as dst:
                     while chunk := src.read(1024 * 1024):
                         dst.write(chunk)
+                staged_files.append(staged)
                 staged_hash = _hash_file(staged)
                 if item.new_hash and staged_hash != item.new_hash:
                     raise ValueError(
@@ -173,10 +180,16 @@ def apply_import(zip_path: Path, plan: list[ImportItem], prefix: str | None = No
                 if not target.is_file() or target.is_symlink():
                     raise ValueError(
                         f"Refusing to replace non-regular file: {target}")
-                backup = backup_dir / f"{index:08d}.bak"
+                backup = target.parent / (
+                    f".{target.name}.llm-dropin-{transaction_id}-{index:08d}.bak"
+                )
+                backup_files.append(backup)
                 shutil.copy2(target, backup)
-            staged = staging_dir / f"{index:08d}.file"
+            staged = target.parent / (
+                f".{target.name}.llm-dropin-{transaction_id}-{index:08d}.tmp"
+            )
             os.replace(staged, target)
+            staged_files.remove(staged)
             unblock_file(target)
             committed.append((target, backup))
             manifest["files"].append({
@@ -189,7 +202,6 @@ def apply_import(zip_path: Path, plan: list[ImportItem], prefix: str | None = No
         (transaction_dir / "manifest.json").write_text(
             json.dumps(manifest, indent=2), encoding="utf-8"
         )
-        shutil.rmtree(staging_dir, ignore_errors=True)
         return len(effective_plan), transaction_id
     except Exception:
         for target, backup in reversed(committed):
@@ -198,6 +210,11 @@ def apply_import(zip_path: Path, plan: list[ImportItem], prefix: str | None = No
                     os.replace(backup, target)
                 elif target.exists():
                     target.unlink()
+            except OSError:
+                pass
+        for path in (*staged_files, *backup_files):
+            try:
+                path.unlink(missing_ok=True)
             except OSError:
                 pass
         shutil.rmtree(transaction_dir, ignore_errors=True)
