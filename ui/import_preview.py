@@ -363,6 +363,8 @@ class ImportPreviewDialog(QDialog):
 
         for action, label in order:
             items = items_by_action.get(action, [])
+            if not items:
+                continue
             action_label = {"replace": "Replace",
                             "new": "Add", "unchanged": "Same"}[action]
             root = QTreeWidgetItem([f"{label}  ·  {len(items)}", "", ""])
@@ -393,6 +395,11 @@ class ImportPreviewDialog(QDialog):
             )
 
         self._apply_tree_semantic_colors()
+        # Apply the current Changed-only setting to the freshly rebuilt tree.
+        # The checkbox is connected before population, but its initial checked
+        # state does not emit a signal, so without this the Unchanged group
+        # incorrectly appears on first load.
+        self._apply_filter(self.only_changed.isChecked())
 
         if self.tree.topLevelItemCount():
             # Prefer a regular actionable file; fall back to a visible ignored file.
