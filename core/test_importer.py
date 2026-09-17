@@ -10,7 +10,7 @@ from pathlib import Path
 
 from core.importer import apply_import, enrich_plan_hashes, make_plan, undo_import
 from core.settings import TRANSACTION_DIR, remember_project
-from core.zip_analyzer import analyze
+from core.zip_analyzer import analyze, analyze_for_import
 
 
 class ZipIgnoreTests(unittest.TestCase):
@@ -54,6 +54,60 @@ class ZipIgnoreTests(unittest.TestCase):
                     "wrapper/important.log",
                 },
             )
+
+    def test_analysis_does_not_hash_unrelated_project_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            target = root / "src" / "main.py"
+            target.parent.mkdir()
+            target.write_text("same", encoding="utf-8")
+            for i in range(1000):
+                decoy = root / "node_modules" / f"pkg{i % 50}" / f"file{i}.js"
+                decoy.parent.mkdir(parents=True, exist_ok=True)
+                decoy.write_text("unrelated", encoding="utf-8")
+
+            zip_path = Path(tmp) / "update.zip"
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr("wrapper/src/main.py", "same")
+                zf.writestr("wrapper/src/new.py", "new")
+
+            import core.zip_analyzer as analyzer
+            original_hash_file = analyzer._hash_file
+            with mock.patch.object(
+                analyzer,
+                "_hash_file",
+                side_effect=original_hash_file,
+                wraps=original_hash_file,
+            ) as hash_file:
+                analysis = analyze_for_import(zip_path, root)
+
+            self.assertLessEqual(hash_file.call_count, 2)
+            self.assertTrue(analysis.filtered_candidates)
+
+    def test_make_plan_can_use_precomputed_hashes_without_zip_access(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            target = root / "same.txt"
+            target.write_text("same", encoding="utf-8")
+            zip_path = Path(tmp) / "update.zip"
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr("wrapper/same.txt", "same")
+
+            analysis = analyze_for_import(zip_path, root)
+            zip_path.unlink()
+            plan = make_plan(
+                analysis.filtered_entries,
+                analysis.filtered_candidates[0].prefix,
+                root,
+                existing_files=analysis.existing_files,
+                archive_hashes=analysis.archive_hashes,
+            )
+
+            self.assertEqual(len(plan), 1)
+            self.assertEqual(plan[0].action, "unchanged")
+            self.assertIsNotNone(plan[0].new_hash)
 
 
 class ImporterTests(unittest.TestCase):

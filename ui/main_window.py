@@ -10,15 +10,15 @@ from PySide6.QtWidgets import (
     QDialog, QProgressBar, QAbstractItemView, QComboBox,
 )
 
-from core.importer import apply_import, cleanup_orphaned_transactions, enrich_plan_hashes, history_entry, make_plan, undo_import
+from core.importer import apply_import, cleanup_orphaned_transactions, history_entry, make_plan, undo_import
 from core.settings import add_history, load_history, load_settings, save_settings, update_history_entry, remember_project
-from core.zip_analyzer import analyze_variants
+from core.zip_analyzer import ImportAnalysis, analyze_for_import
 from ui.import_preview import ImportPreviewDialog
 from ui.theme import apply_theme, set_style_class
 
 
 class ZipWorker(QObject):
-    analyzed = Signal(object, object, object, object, object)
+    analyzed = Signal(object, object)
     failed = Signal(str)
     finished = Signal()
 
@@ -29,16 +29,8 @@ class ZipWorker(QObject):
 
     def run(self):
         try:
-            filtered, included = analyze_variants(self.path, self.project)
-            filtered_entries, filtered_candidates = filtered
-            included_entries, included_candidates = included
-            self.analyzed.emit(
-                self.path,
-                filtered_entries,
-                filtered_candidates,
-                included_entries,
-                included_candidates,
-            )
+            analysis = analyze_for_import(self.path, self.project)
+            self.analyzed.emit(self.path, analysis)
         except Exception as exc:
             self.failed.emit(str(exc))
         finally:
@@ -523,12 +515,16 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "Could not analyze ZIP", message)
         self._set_status("Analysis failed", error=True)
 
-    def _analysis_ready(self, path, entries, candidates, included_entries, included_candidates):
+    def _analysis_ready(self, path, analysis: ImportAnalysis):
         project = self.project
         if project is None or not project.exists() or not project.is_dir():
             QMessageBox.warning(self, "No project",
                                 "Select a project folder first.")
             return
+        entries = analysis.filtered_entries
+        candidates = analysis.filtered_candidates
+        included_entries = analysis.included_entries
+        included_candidates = analysis.included_candidates
         detection_candidates = candidates or included_candidates
         if not detection_candidates:
             QMessageBox.warning(self, "No usable structure",
@@ -548,11 +544,19 @@ class MainWindow(QMainWindow):
             self._set_status("Waiting for another archive")
             return
         try:
-            plan = enrich_plan_hashes(
-                path, make_plan(entries, best.prefix, project)
+            plan = make_plan(
+                entries,
+                best.prefix,
+                project,
+                existing_files=analysis.existing_files,
+                archive_hashes=analysis.archive_hashes,
             )
-            included_plan = enrich_plan_hashes(
-                path, make_plan(included_entries, best.prefix, project)
+            included_plan = make_plan(
+                included_entries,
+                best.prefix,
+                project,
+                existing_files=analysis.existing_files,
+                archive_hashes=analysis.archive_hashes,
             )
             filtered_archive_paths = {item.archive_path for item in plan}
             gitignored_plan = [

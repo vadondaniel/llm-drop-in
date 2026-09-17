@@ -37,12 +37,18 @@ def _hash_file(path: Path) -> str:
         return _hash_stream(fh)
 
 
-def make_plan(entries: list[ZipEntry], prefix: str, project_root: Path) -> list[ImportItem]:
+def make_plan(
+    entries: list[ZipEntry],
+    prefix: str,
+    project_root: Path,
+    *,
+    existing_files: dict[str, tuple[Path, str | None]] | None = None,
+    archive_hashes: dict[str, str] | None = None,
+) -> list[ImportItem]:
     root = project_root.resolve()
     plan: list[ImportItem] = []
     destinations: set[str] = set()
-    with_project_paths = {p.relative_to(root).as_posix().casefold(
-    ): p for p in root.rglob("*") if p.is_file() and not p.is_symlink()}
+    cache = existing_files if existing_files is not None else {}
 
     for entry in entries:
         if entry.is_dir:
@@ -64,11 +70,36 @@ def make_plan(entries: list[ZipEntry], prefix: str, project_root: Path) -> list[
                 f"Destination escapes project root: {rel}") from exc
         if target.exists() and (target.is_symlink() or not target.is_file()):
             raise ValueError(f"Destination is not a regular file: {rel}")
-        existing = with_project_paths.get(key)
-        old_hash = _hash_file(existing) if existing else None
-        action = "replace" if existing else "new"
-        plan.append(ImportItem(entry.archive_path, target,
-                    action, entry.size, old_hash=old_hash))
+
+        cached = cache.get(key)
+        if cached is None:
+            if target.is_file() and not target.is_symlink():
+                cached = (target, _hash_file(target))
+                cache[key] = cached
+        elif cached[1] is None:
+            cached = (cached[0], _hash_file(cached[0]))
+            cache[key] = cached
+
+        existing_path = cached[0] if cached is not None else None
+        old_hash = cached[1] if cached is not None else None
+        new_hash = archive_hashes.get(
+            entry.archive_path) if archive_hashes else None
+        if existing_path is None:
+            action = "new"
+        elif new_hash is not None and old_hash == new_hash:
+            action = "unchanged"
+        else:
+            action = "replace"
+        plan.append(
+            ImportItem(
+                entry.archive_path,
+                target,
+                action,
+                entry.size,
+                old_hash=old_hash,
+                new_hash=new_hash,
+            )
+        )
     return plan
 
 

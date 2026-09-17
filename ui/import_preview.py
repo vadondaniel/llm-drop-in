@@ -4,7 +4,7 @@ import difflib
 import zipfile
 from collections import defaultdict
 
-from PySide6.QtCore import QSize, Qt
+from PySide6.QtCore import QSize, Qt, QTimer
 from PySide6.QtGui import QBrush, QFontDatabase, QSyntaxHighlighter, QTextCharFormat
 from PySide6.QtWidgets import (
     QApplication,
@@ -72,7 +72,6 @@ class DiffView(QPlainTextEdit):
 
     def show_diff(self, text: str):
         self.setPlainText(text)
-        self.highlighter.rehighlight()
 
 
 class ImportPreviewDialog(QDialog):
@@ -348,64 +347,70 @@ class ImportPreviewDialog(QDialog):
         item.setSizeHint(0, QSize(0, height))
 
     def _populate_tree(self):
-        self.tree.clear()
-        order = [("replace", "Modified"), ("new", "New"),
-                 ("unchanged", "Unchanged")]
-        group_role = GROUP_ROLE
+        # Building a QTreeWidget item-by-item while it is visible causes Qt to
+        # relayout, repaint, and emit item signals repeatedly. Build the whole
+        # tree in one batch instead.
+        previous_signals_blocked = self.tree.blockSignals(True)
+        self.tree.setUpdatesEnabled(False)
+        try:
+            self.tree.clear()
+            order = [("replace", "Modified"), ("new", "New"),
+                     ("unchanged", "Unchanged")]
 
-        regular_items = [
-            item for item in self.plan
-            if item.archive_path not in self._ignored_archive_paths
-        ]
-        items_by_action = defaultdict(list)
-        for item in regular_items:
-            items_by_action[item.action].append(item)
+            regular_items = [
+                item for item in self.plan
+                if item.archive_path not in self._ignored_archive_paths
+            ]
+            items_by_action = defaultdict(list)
+            for item in regular_items:
+                items_by_action[item.action].append(item)
 
-        for action, label in order:
-            items = items_by_action.get(action, [])
-            if not items:
-                continue
-            action_label = {"replace": "Replace",
-                            "new": "Add", "unchanged": "Same"}[action]
-            root = QTreeWidgetItem([f"{label}  ·  {len(items)}", "", ""])
-            root.setExpanded(action != "unchanged")
-            root.setData(0, group_role, action)
-            root.setFlags(Qt.ItemFlag.ItemIsEnabled |
-                          Qt.ItemFlag.ItemIsSelectable)
-            self._set_tree_row_height(root, 32)
-            self.tree.addTopLevelItem(root)
-            self._add_tree_files(root, items, action_label, selectable=True)
+            top_level_items: list[QTreeWidgetItem] = []
+            for action, label in order:
+                items = items_by_action.get(action, [])
+                if not items:
+                    continue
+                action_label = {
+                    "replace": "Replace",
+                    "new": "Add",
+                    "unchanged": "Same",
+                }[action]
+                root = QTreeWidgetItem([f"{label}  ·  {len(items)}", "", ""])
+                root.setExpanded(action != "unchanged")
+                root.setData(0, GROUP_ROLE, action)
+                root.setFlags(Qt.ItemFlag.ItemIsEnabled |
+                              Qt.ItemFlag.ItemIsSelectable)
+                self._set_tree_row_height(root, 32)
+                self._add_tree_files(
+                    root, items, action_label, selectable=True)
+                top_level_items.append(root)
 
-        ignored = sorted(
-            self.gitignored_plan,
-            key=lambda x: x.target_path.as_posix().casefold(),
-        )
-        if ignored:
-            action_label = "Ignored"
-            root = QTreeWidgetItem([f"Git-ignored  ·  {len(ignored)}", "", ""])
-            root.setExpanded(True)
-            root.setData(0, group_role, "ignored")
-            root.setFlags(Qt.ItemFlag.ItemIsEnabled |
-                          Qt.ItemFlag.ItemIsSelectable)
-            self._set_tree_row_height(root, 32)
-            self.tree.addTopLevelItem(root)
-            self._add_tree_files(
-                root, ignored, action_label,
-                selectable=self._show_gitignored,
+            ignored = sorted(
+                self.gitignored_plan,
+                key=lambda x: x.target_path.as_posix().casefold(),
             )
+            if ignored:
+                root = QTreeWidgetItem(
+                    [f"Git-ignored  ·  {len(ignored)}", "", ""]
+                )
+                root.setExpanded(True)
+                root.setData(0, GROUP_ROLE, "ignored")
+                root.setFlags(Qt.ItemFlag.ItemIsEnabled |
+                              Qt.ItemFlag.ItemIsSelectable)
+                self._set_tree_row_height(root, 32)
+                self._add_tree_files(
+                    root, ignored, "Ignored", selectable=self._show_gitignored
+                )
+                top_level_items.append(root)
 
-        self._apply_tree_semantic_colors()
-        # Apply the current Changed-only setting to the freshly rebuilt tree.
-        # The checkbox is connected before population, but its initial checked
-        # state does not emit a signal, so without this the Unchanged group
-        # incorrectly appears on first load.
-        self._apply_filter(self.only_changed.isChecked())
+            self.tree.addTopLevelItems(top_level_items)
+            self._apply_tree_semantic_colors()
+            self._apply_filter(self.only_changed.isChecked())
 
-        if self.tree.topLevelItemCount():
             # Prefer a regular actionable file; fall back to a visible ignored file.
             for i in range(self.tree.topLevelItemCount()):
                 root = self.tree.topLevelItem(i)
-                if root is None or not root.childCount():
+                if root is None or not root.childCount() or root.isHidden():
                     continue
                 root.setExpanded(i < 2 or root.text(
                     0).startswith("Git-ignored"))
@@ -413,7 +418,19 @@ class ImportPreviewDialog(QDialog):
                     child = root.child(j)
                     if child is not None and child.data(0, Qt.ItemDataRole.UserRole) is not None:
                         self.tree.setCurrentItem(child)
-                        return
+                        break
+                else:
+                    continue
+                break
+        finally:
+            self.tree.setUpdatesEnabled(True)
+            self.tree.blockSignals(previous_signals_blocked)
+
+        # Diff generation can be significantly more expensive than displaying
+        # the tree. Defer the initial diff until the dialog has entered its
+        # event loop so the preview becomes visible immediately.
+        if self.tree.currentItem() is not None:
+            QTimer.singleShot(0, self._show_selected_diff)
 
     def _apply_tree_semantic_colors(self):
         tokens = getattr(self, "_tokens", None)
@@ -452,11 +469,10 @@ class ImportPreviewDialog(QDialog):
         *,
         selectable: bool,
     ):
+        children: list[QTreeWidgetItem] = []
         for item in items:
             rel = item.target_path.relative_to(self.project_root).as_posix()
-            child = QTreeWidgetItem(
-                [rel, action_label, f"{item.size:,} B"]
-            )
+            child = QTreeWidgetItem([rel, action_label, f"{item.size:,} B"])
             child.setData(0, Qt.ItemDataRole.UserRole, item)
             child.setToolTip(
                 0,
@@ -474,7 +490,8 @@ class ImportPreviewDialog(QDialog):
             else:
                 child.setFlags(child.flags() | Qt.ItemFlag.ItemIsSelectable)
             self._set_tree_row_height(child, 34)
-            root.addChild(child)
+            children.append(child)
+        root.addChildren(children)
 
     def _apply_filter(self, changed_only: bool):
         unchanged_root = None

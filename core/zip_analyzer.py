@@ -33,6 +33,17 @@ class ZipCandidate:
     score: float
 
 
+@dataclass(frozen=True)
+class ImportAnalysis:
+    filtered_entries: list[ZipEntry]
+    filtered_candidates: list[ZipCandidate]
+    included_entries: list[ZipEntry]
+    included_candidates: list[ZipCandidate]
+    archive_hashes: dict[str, str]
+    existing_files: dict[str, tuple[Path, str | None]]
+    ignored_archive_paths: set[str]
+
+
 def _clean_archive_path(name: str) -> str:
     name = name.replace("\\", "/").strip("/")
     parts = []
@@ -83,6 +94,7 @@ def read_zip(
             )
         result: list[ZipEntry] = []
         seen: set[str] = set()
+        seen_casefold: set[str] = set()
         for info in infos:
             clean = _clean_archive_path(info.filename)
             is_dir = info.is_dir() or info.filename.endswith(("/", "\\"))
@@ -92,10 +104,12 @@ def read_zip(
                 continue
             if not is_dir:
                 validate_relative_path(clean)
-                if clean.casefold() in {p.casefold() for p in seen}:
+                clean_key = clean.casefold()
+                if clean_key in seen_casefold:
                     raise ValueError(
                         f"ZIP contains duplicate/case-colliding path: {clean}")
                 seen.add(clean)
+                seen_casefold.add(clean_key)
                 ratio = info.file_size / max(1, info.compress_size)
                 if ratio > max_compression_ratio and info.file_size > 1024 * 1024:
                     raise ValueError(
@@ -170,31 +184,29 @@ def _git_ignored_paths(project_root: Path, paths: list[str]) -> set[str]:
     return {path for path in result.stdout.split("\0") if path}
 
 
-def _existing_files(project_root: Path) -> dict[str, tuple[Path, str]]:
-    root = project_root.resolve()
-    result: dict[str, tuple[Path, str]] = {}
-    for p in root.rglob("*"):
-        if p.is_file() and not p.is_symlink():
-            rel = p.relative_to(root).as_posix()
-            result[rel.casefold()] = (p, _hash_file(p))
-    return result
-
-
 def _build_candidates(
     entries: list[ZipEntry],
     project_root: Path,
     archive_hashes: dict[str, str],
-    existing: dict[str, tuple[Path, str]],
+    existing: dict[str, tuple[Path, str | None]],
 ) -> list[ZipCandidate]:
-    candidates: list[ZipCandidate] = []
+    # Candidate detection used to recursively enumerate and SHA-256 every file in
+    # the project. That is needlessly expensive for repositories containing
+    # node_modules, build outputs, caches, or large generated files. Instead,
+    # inspect only destination paths that occur in the archive, and only hash
+    # files after the candidates with the largest archive coverage are known.
+    provisional: list[tuple[str, int, int,
+                            int, int, list[tuple[str, str]]]] = []
+    max_considered = 0
+
     for prefix in candidate_prefixes(entries):
-        mapped = unchanged = new = conflicts = 0
-        paths: list[str] = []
+        mapped = new = conflicts = considered = 0
+        paths: list[tuple[str, str]] = []
         seen_targets: set[str] = set()
-        for e in entries:
-            if e.is_dir:
+        for entry in entries:
+            if entry.is_dir:
                 continue
-            rel = relative_after_prefix(e.archive_path, prefix)
+            rel = relative_after_prefix(entry.archive_path, prefix)
             if not rel:
                 continue
             validate_relative_path(rel)
@@ -203,26 +215,48 @@ def _build_candidates(
                 conflicts += 1
                 continue
             seen_targets.add(key)
-            paths.append(rel)
-            existing_item = existing.get(key)
-            if existing_item:
+            paths.append((rel, entry.archive_path))
+            considered += 1
+
+            cached = existing.get(key)
+            if cached is not None:
                 mapped += 1
-                existing_path, old_hash = existing_item
-                if old_hash == archive_hashes[e.archive_path]:
-                    unchanged += 1
+                continue
+
+            target = project_root / Path(*PurePosixPath(rel).parts)
+            if target.is_symlink() or (target.exists() and not target.is_file()):
+                conflicts += 1
+            elif target.is_file():
+                mapped += 1
+                existing[key] = (target, None)
             else:
                 new += 1
-            # A file cannot safely replace an existing directory.
-            target = project_root / Path(*PurePosixPath(rel).parts)
-            if target.exists() and not target.is_file():
-                conflicts += 1
 
-        if conflicts or not paths:
+        if not paths or conflicts:
             continue
-        considered = len(paths)
-        # Strongly prefer candidates that explain the archive and reuse existing files,
-        # while treating unchanged files as more reliable evidence than arbitrary new files.
-        score = (unchanged * 12 + mapped * 5 + new * 1) / max(1, considered)
+        max_considered = max(max_considered, considered)
+        provisional.append(
+            (prefix, mapped, new, conflicts, considered, paths)
+        )
+
+    candidates: list[ZipCandidate] = []
+    # The candidate sort always ranks considered_count first, so unchanged-file
+    # hashes only matter for candidates tied at the maximum coverage.
+    for prefix, mapped, new, conflicts, considered, paths in provisional:
+        unchanged = 0
+        if considered == max_considered:
+            for rel, archive_path in paths:
+                cached = existing.get(rel.casefold())
+                if cached is None:
+                    continue
+                existing_path, old_hash = cached
+                if old_hash is None:
+                    old_hash = _hash_file(existing_path)
+                    existing[rel.casefold()] = (existing_path, old_hash)
+                if old_hash == archive_hashes[archive_path]:
+                    unchanged += 1
+
+        score = (unchanged * 12 + mapped * 5 + new) / max(1, considered)
         candidates.append(
             ZipCandidate(prefix, mapped, new, unchanged,
                          conflicts, considered, score)
@@ -242,15 +276,15 @@ def _build_candidates(
     return candidates
 
 
-def analyze_variants(
+def analyze_for_import(
     zip_path: Path,
     project_root: Path,
-) -> tuple[tuple[list[ZipEntry], list[ZipCandidate]], tuple[list[ZipEntry], list[ZipCandidate]]]:
-    """Analyze the archive both with and without Git-ignored files.
+) -> ImportAnalysis:
+    """Perform the expensive archive analysis once and retain reusable data.
 
-    The ZIP is read and hashed once so the import preview can switch between
-    the default filtered view and the explicit include-ignored view without
-    redoing the expensive archive analysis.
+    The returned archive hashes and lazily populated existing-file cache can be
+    reused when constructing both filtered and include-ignored import plans, so
+    the main UI never needs to scan or hash the project tree again.
     """
     project_root = project_root.resolve()
     if not project_root.is_dir():
@@ -265,25 +299,44 @@ def analyze_variants(
         if e.is_dir or e.archive_path not in ignored
     ]
 
-    existing = _existing_files(project_root)
     with zipfile.ZipFile(zip_path) as zf:
         archive_hashes: dict[str, str] = {}
-        for e in all_entries:
-            if e.is_dir:
+        for entry in all_entries:
+            if entry.is_dir:
                 continue
-            with zf.open(e.archive_path, "r") as src:
+            with zf.open(entry.archive_path, "r") as src:
                 digest = hashlib.sha256()
-                while chunk := src.read(1024 * 1024):
+                for chunk in iter(lambda: src.read(1024 * 1024), b""):
                     digest.update(chunk)
-                archive_hashes[e.archive_path] = digest.hexdigest()
+                archive_hashes[entry.archive_path] = digest.hexdigest()
 
+    existing: dict[str, tuple[Path, str | None]] = {}
     filtered_candidates = _build_candidates(
         filtered_entries, project_root, archive_hashes, existing
     )
     included_candidates = _build_candidates(
         all_entries, project_root, archive_hashes, existing
     )
-    return (filtered_entries, filtered_candidates), (all_entries, included_candidates)
+    return ImportAnalysis(
+        filtered_entries=filtered_entries,
+        filtered_candidates=filtered_candidates,
+        included_entries=all_entries,
+        included_candidates=included_candidates,
+        archive_hashes=archive_hashes,
+        existing_files=existing,
+        ignored_archive_paths=ignored,
+    )
+
+
+def analyze_variants(
+    zip_path: Path,
+    project_root: Path,
+) -> tuple[tuple[list[ZipEntry], list[ZipCandidate]], tuple[list[ZipEntry], list[ZipCandidate]]]:
+    analysis = analyze_for_import(zip_path, project_root)
+    return (
+        (analysis.filtered_entries, analysis.filtered_candidates),
+        (analysis.included_entries, analysis.included_candidates),
+    )
 
 
 def analyze(
