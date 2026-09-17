@@ -138,13 +138,29 @@ class DiffView(QPlainTextEdit):
 
 
 class ImportPreviewDialog(QDialog):
-    def __init__(self, project_root, project_name: str, prefix: str, plan: list[ImportItem], zip_path, parent=None):
+    def __init__(
+        self,
+        project_root,
+        project_name: str,
+        prefix: str,
+        plan: list[ImportItem],
+        include_gitignored_plan: list[ImportItem],
+        gitignored_plan: list[ImportItem],
+        zip_path,
+        parent=None,
+    ):
         super().__init__(parent)
         self.setWindowTitle("Review import")
         self.resize(1180, 760)
         self.setMinimumSize(960, 640)
         self.project_root = project_root
         self.plan = plan
+        self._filtered_plan = list(plan)
+        self.include_gitignored_plan = include_gitignored_plan
+        self.gitignored_plan = gitignored_plan
+        self._ignored_archive_paths = {
+            item.archive_path for item in gitignored_plan}
+        self._show_gitignored = False
         self.zip_path = zip_path
         self.selected: list[ImportItem] = []
         self._zip = zipfile.ZipFile(zip_path)
@@ -152,6 +168,7 @@ class ImportPreviewDialog(QDialog):
         self._items_by_action = defaultdict(list)
         for item in plan:
             self._items_by_action[item.action].append(item)
+        self._stat_values: dict[str, QLabel] = {}
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(22, 20, 22, 20)
@@ -191,6 +208,10 @@ class ImportPreviewDialog(QDialog):
                        "Files that do not exist in the project")
         self._add_stat(stats, 2, "Unchanged", unchanged,
                        "Already identical; hidden by default")
+        self._add_stat(
+            stats, 3, "Git-ignored", len(self.gitignored_plan),
+            "Matched by Git ignore rules; excluded by default",
+        )
         info_layout.addLayout(stats)
         layout.addWidget(info)
 
@@ -207,6 +228,19 @@ class ImportPreviewDialog(QDialog):
         files_title.setObjectName("SectionTitle")
         files_header.addWidget(files_title)
         files_header.addStretch()
+        self.include_gitignored_toggle = VisibleCheckBox(
+            "Include Git-ignored files")
+        ignored_count = len(self.gitignored_plan)
+        self.include_gitignored_toggle.setEnabled(bool(ignored_count))
+        self.include_gitignored_toggle.setToolTip(
+            f"{ignored_count} file(s) in this archive are matched by Git's ignore rules. "
+            "They are excluded by default for this import only."
+            if ignored_count
+            else "No additional Git-ignored files are present in this import."
+        )
+        self.include_gitignored_toggle.toggled.connect(
+            self._include_gitignored_changed)
+        files_header.addWidget(self.include_gitignored_toggle)
         self.only_changed = VisibleCheckBox("Changed only")
         self.only_changed.setChecked(True)
         self.only_changed.toggled.connect(self._apply_filter)
@@ -350,14 +384,14 @@ class ImportPreviewDialog(QDialog):
         self._populate_tree()
         self._update_selection_summary()
 
-    @staticmethod
-    def _add_stat(grid: QGridLayout, column: int, label: str, value: int, hint: str):
+    def _add_stat(self, grid: QGridLayout, column: int, label: str, value: int, hint: str):
         block = QWidget()
         layout = QVBoxLayout(block)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         value_label = QLabel(str(value))
         value_label.setObjectName("StatValue")
+        self._stat_values[label] = value_label
         label_widget = QLabel(label)
         label_widget.setObjectName("StatLabel")
         hint_widget = QLabel(hint)
@@ -367,59 +401,129 @@ class ImportPreviewDialog(QDialog):
         layout.addWidget(hint_widget)
         grid.addWidget(block, 0, column)
 
+    def _include_gitignored_changed(self, enabled: bool):
+        self._show_gitignored = enabled
+        self.plan = (
+            self.include_gitignored_plan
+            if enabled
+            else self._filtered_plan
+        )
+        self._rebuild_plan_view()
+
+    def _rebuild_plan_view(self):
+        self._items_by_action = defaultdict(list)
+        for item in self.plan:
+            self._items_by_action[item.action].append(item)
+        replace = sum(x.action == "replace" for x in self.plan)
+        new = sum(x.action == "new" for x in self.plan)
+        unchanged = sum(x.action == "unchanged" for x in self.plan)
+        for label, value in (("Modified", replace), ("New", new), ("Unchanged", unchanged)):
+            widget = self._stat_values.get(label)
+            if widget is not None:
+                widget.setText(str(value))
+        self._populate_tree()
+        self._update_selection_summary()
+
     def _populate_tree(self):
         self.tree.clear()
         order = [("replace", "Modified"), ("new", "New"),
                  ("unchanged", "Unchanged")]
-        roots = {}
         group_styles = {
             "replace": ("#fff0f0", "#963b3b", "Replace"),
             "new": ("#eef8f1", "#23613f", "Add"),
             "unchanged": ("#f1f3f4", "#69747b", "Same"),
+            "ignored": ("#fff7e8", "#8a5a00", "Ignored"),
         }
+
+        regular_items = [
+            item for item in self.plan
+            if item.archive_path not in self._ignored_archive_paths
+        ]
+        items_by_action = defaultdict(list)
+        for item in regular_items:
+            items_by_action[item.action].append(item)
+
         for action, label in order:
-            items = self._items_by_action.get(action, [])
+            items = items_by_action.get(action, [])
             bg, fg, action_label = group_styles[action]
             root = QTreeWidgetItem([f"{label}  ·  {len(items)}", "", ""])
             root.setExpanded(action != "unchanged")
-            root.setFirstColumnSpanned(False)
             root.setFlags(Qt.ItemFlag.ItemIsEnabled |
                           Qt.ItemFlag.ItemIsSelectable)
             root.setBackground(0, QBrush(QColor(bg)))
             root.setForeground(0, QBrush(QColor(fg)))
             self.tree.addTopLevelItem(root)
-            roots[action] = root
-            for item in sorted(items, key=lambda x: x.target_path.as_posix().casefold()):
-                rel = item.target_path.relative_to(
-                    self.project_root).as_posix()
-                child = QTreeWidgetItem(
-                    [rel, action_label, f"{item.size:,} B"])
-                child.setData(0, Qt.ItemDataRole.UserRole, item)
-                child.setToolTip(0, rel)
-                child.setForeground(1, QBrush(QColor(fg)))
-                if item.action != "unchanged":
-                    child.setFlags(
-                        child.flags()
-                        | Qt.ItemFlag.ItemIsUserCheckable
-                        | Qt.ItemFlag.ItemIsSelectable
-                    )
-                    child.setCheckState(0, Qt.CheckState.Checked)
-                else:
-                    child.setFlags(
-                        child.flags() | Qt.ItemFlag.ItemIsSelectable)
-                root.addChild(child)
+            self._add_tree_files(root, items, bg, fg,
+                                 action_label, selectable=True)
+
+        ignored = sorted(
+            self.gitignored_plan,
+            key=lambda x: x.target_path.as_posix().casefold(),
+        )
+        if ignored:
+            bg, fg, action_label = group_styles["ignored"]
+            root = QTreeWidgetItem([f"Git-ignored  ·  {len(ignored)}", "", ""])
+            root.setExpanded(True)
+            root.setFlags(Qt.ItemFlag.ItemIsEnabled |
+                          Qt.ItemFlag.ItemIsSelectable)
+            root.setBackground(0, QBrush(QColor(bg)))
+            root.setForeground(0, QBrush(QColor(fg)))
+            self.tree.addTopLevelItem(root)
+            self._add_tree_files(
+                root, ignored, bg, fg, action_label,
+                selectable=self._show_gitignored,
+            )
+
         if self.tree.topLevelItemCount():
-            # Select the first actionable file rather than a group header.
+            # Prefer a regular actionable file; fall back to a visible ignored file.
             for i in range(self.tree.topLevelItemCount()):
                 root = self.tree.topLevelItem(i)
-                if root is None:
+                if root is None or not root.childCount():
                     continue
-                if root.childCount():
-                    root.setExpanded(i < 2)
-                    child = root.child(0)
+                root.setExpanded(i < 2 or root.text(
+                    0).startswith("Git-ignored"))
+                for j in range(root.childCount()):
+                    child = root.child(j)
                     if child is not None and child.data(0, Qt.ItemDataRole.UserRole) is not None:
                         self.tree.setCurrentItem(child)
-                        break
+                        return
+
+    def _add_tree_files(
+        self,
+        root: QTreeWidgetItem,
+        items: list[ImportItem],
+        bg: str,
+        fg: str,
+        action_label: str,
+        *,
+        selectable: bool,
+    ):
+        for item in items:
+            rel = item.target_path.relative_to(self.project_root).as_posix()
+            child = QTreeWidgetItem(
+                [rel, action_label, f"{item.size:,} B"]
+            )
+            child.setData(0, Qt.ItemDataRole.UserRole, item)
+            child.setToolTip(
+                0,
+                f"{rel}\nExcluded by Git ignore rules by default."
+                if item.archive_path in self._ignored_archive_paths
+                else rel,
+            )
+            child.setForeground(1, QBrush(QColor(fg)))
+            if item.action != "unchanged" and selectable:
+                child.setFlags(
+                    child.flags()
+                    | Qt.ItemFlag.ItemIsUserCheckable
+                    | Qt.ItemFlag.ItemIsSelectable
+                )
+                child.setCheckState(0, Qt.CheckState.Checked)
+            else:
+                child.setFlags(child.flags() | Qt.ItemFlag.ItemIsSelectable)
+                if item.archive_path in self._ignored_archive_paths and not selectable:
+                    child.setForeground(0, QBrush(QColor("#8a9298")))
+                    child.setForeground(1, QBrush(QColor("#8a9298")))
+            root.addChild(child)
 
     def _apply_filter(self, changed_only: bool):
         unchanged_root = None
@@ -492,7 +596,10 @@ class ImportPreviewDialog(QDialog):
         if not isinstance(item, ImportItem):
             return
         rel = item.target_path.relative_to(self.project_root).as_posix()
-        label = "MODIFIED" if item.action == "replace" else "NEW" if item.action == "new" else "UNCHANGED"
+        if item.archive_path in self._ignored_archive_paths:
+            label = "GIT-IGNORED"
+        else:
+            label = "MODIFIED" if item.action == "replace" else "NEW" if item.action == "new" else "UNCHANGED"
         self.diff_title.setText(
             f"<b>{label}</b>  ·  {rel}  ·  {item.size:,} bytes")
         try:

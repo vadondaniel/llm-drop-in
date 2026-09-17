@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import shutil
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -9,6 +11,49 @@ from pathlib import Path
 from core.importer import apply_import, enrich_plan_hashes, make_plan, undo_import
 from core.settings import TRANSACTION_DIR, remember_project
 from core.zip_analyzer import analyze
+
+
+class ZipIgnoreTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("git"), "Git is required for ignore-rule tests")
+    def test_gitignored_files_are_excluded_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            (root / ".gitignore").write_text(
+                "build/\n*.log\n!important.log\n", encoding="utf-8"
+            )
+            zip_path = Path(tmp) / "update.zip"
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr("wrapper/src/main.py", "print('ok')")
+                zf.writestr("wrapper/debug.log", "ignored")
+                zf.writestr("wrapper/build/output.bin", b"ignored")
+                zf.writestr("wrapper/important.log", "included")
+
+            entries, candidates = analyze(zip_path, root)
+            names = {e.archive_path for e in entries if not e.is_dir}
+            self.assertEqual(
+                names,
+                {
+                    "wrapper/src/main.py",
+                    "wrapper/important.log",
+                },
+            )
+            self.assertTrue(candidates)
+
+            entries, _ = analyze(
+                zip_path, root, include_gitignored=True
+            )
+            names = {e.archive_path for e in entries if not e.is_dir}
+            self.assertEqual(
+                names,
+                {
+                    "wrapper/src/main.py",
+                    "wrapper/debug.log",
+                    "wrapper/build/output.bin",
+                    "wrapper/important.log",
+                },
+            )
 
 
 class ImporterTests(unittest.TestCase):

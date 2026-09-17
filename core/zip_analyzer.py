@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 import hashlib
 import os
+import subprocess
 import zipfile
 
 
@@ -129,6 +130,46 @@ def _hash_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
+def _git_ignored_paths(project_root: Path, paths: list[str]) -> set[str]:
+    """Return archive-relative paths matched by Git ignore rules.
+
+    Git itself is used so .gitignore, nested .gitignore files, .git/info/exclude,
+    and configured global excludes all follow the same matching semantics as Git.
+    ``--no-index`` is important because the incoming ZIP files are not yet tracked
+    in the working tree. If the project is not inside a Git work tree, or Git is
+    unavailable, no paths are filtered.
+    """
+    if not paths:
+        return set()
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(project_root),
+                "check-ignore",
+                "--stdin",
+                "--no-index",
+                "-z",
+            ],
+            input="\0".join(paths) + "\0",
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            check=False,
+        )
+    except (FileNotFoundError, OSError):
+        return set()
+
+    # 0 = at least one path matched, 1 = no paths matched. Other statuses
+    # indicate that the directory is not a Git work tree (or another Git
+    # invocation problem); in that case imports continue without filtering.
+    if result.returncode not in (0, 1):
+        return set()
+    return {path for path in result.stdout.split("\0") if path}
+
+
 def _existing_files(project_root: Path) -> dict[str, tuple[Path, str]]:
     root = project_root.resolve()
     result: dict[str, tuple[Path, str]] = {}
@@ -139,25 +180,13 @@ def _existing_files(project_root: Path) -> dict[str, tuple[Path, str]]:
     return result
 
 
-def analyze(zip_path: Path, project_root: Path) -> tuple[list[ZipEntry], list[ZipCandidate]]:
-    project_root = project_root.resolve()
-    if not project_root.is_dir():
-        raise ValueError(
-            "Project folder does not exist or is not a directory.")
-    entries = read_zip(zip_path)
-    existing = _existing_files(project_root)
+def _build_candidates(
+    entries: list[ZipEntry],
+    project_root: Path,
+    archive_hashes: dict[str, str],
+    existing: dict[str, tuple[Path, str]],
+) -> list[ZipCandidate]:
     candidates: list[ZipCandidate] = []
-    with zipfile.ZipFile(zip_path) as zf:
-        archive_hashes: dict[str, str] = {}
-        for e in entries:
-            if e.is_dir:
-                continue
-            with zf.open(e.archive_path, "r") as src:
-                digest = hashlib.sha256()
-                while chunk := src.read(1024 * 1024):
-                    digest.update(chunk)
-                archive_hashes[e.archive_path] = digest.hexdigest()
-
     for prefix in candidate_prefixes(entries):
         mapped = unchanged = new = conflicts = 0
         paths: list[str] = []
@@ -210,4 +239,59 @@ def analyze(zip_path: Path, project_root: Path) -> tuple[list[ZipEntry], list[Zi
         ),
         reverse=True,
     )
-    return entries, candidates
+    return candidates
+
+
+def analyze_variants(
+    zip_path: Path,
+    project_root: Path,
+) -> tuple[tuple[list[ZipEntry], list[ZipCandidate]], tuple[list[ZipEntry], list[ZipCandidate]]]:
+    """Analyze the archive both with and without Git-ignored files.
+
+    The ZIP is read and hashed once so the import preview can switch between
+    the default filtered view and the explicit include-ignored view without
+    redoing the expensive archive analysis.
+    """
+    project_root = project_root.resolve()
+    if not project_root.is_dir():
+        raise ValueError(
+            "Project folder does not exist or is not a directory.")
+
+    all_entries = read_zip(zip_path)
+    file_paths = [e.archive_path for e in all_entries if not e.is_dir]
+    ignored = _git_ignored_paths(project_root, file_paths)
+    filtered_entries = [
+        e for e in all_entries
+        if e.is_dir or e.archive_path not in ignored
+    ]
+
+    existing = _existing_files(project_root)
+    with zipfile.ZipFile(zip_path) as zf:
+        archive_hashes: dict[str, str] = {}
+        for e in all_entries:
+            if e.is_dir:
+                continue
+            with zf.open(e.archive_path, "r") as src:
+                digest = hashlib.sha256()
+                while chunk := src.read(1024 * 1024):
+                    digest.update(chunk)
+                archive_hashes[e.archive_path] = digest.hexdigest()
+
+    filtered_candidates = _build_candidates(
+        filtered_entries, project_root, archive_hashes, existing
+    )
+    included_candidates = _build_candidates(
+        all_entries, project_root, archive_hashes, existing
+    )
+    return (filtered_entries, filtered_candidates), (all_entries, included_candidates)
+
+
+def analyze(
+    zip_path: Path,
+    project_root: Path,
+    *,
+    include_gitignored: bool = False,
+) -> tuple[list[ZipEntry], list[ZipCandidate]]:
+    """Analyze an archive, optionally including files matched by Git ignore rules."""
+    filtered, included = analyze_variants(zip_path, project_root)
+    return included if include_gitignored else filtered

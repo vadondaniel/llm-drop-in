@@ -12,12 +12,12 @@ from PySide6.QtWidgets import (
 
 from core.importer import apply_import, cleanup_orphaned_transactions, enrich_plan_hashes, history_entry, make_plan, undo_import
 from core.settings import add_history, load_history, load_settings, save_settings, update_history_entry, remember_project
-from core.zip_analyzer import analyze
+from core.zip_analyzer import analyze_variants
 from ui.import_preview import ImportPreviewDialog
 
 
 class ZipWorker(QObject):
-    analyzed = Signal(object, object, object)
+    analyzed = Signal(object, object, object, object, object)
     failed = Signal(str)
     finished = Signal()
 
@@ -28,8 +28,16 @@ class ZipWorker(QObject):
 
     def run(self):
         try:
-            entries, candidates = analyze(self.path, self.project)
-            self.analyzed.emit(self.path, entries, candidates)
+            filtered, included = analyze_variants(self.path, self.project)
+            filtered_entries, filtered_candidates = filtered
+            included_entries, included_candidates = included
+            self.analyzed.emit(
+                self.path,
+                filtered_entries,
+                filtered_candidates,
+                included_entries,
+                included_candidates,
+            )
         except Exception as exc:
             self.failed.emit(str(exc))
         finally:
@@ -568,18 +576,19 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "Could not analyze ZIP", message)
         self._set_status("Analysis failed", error=True)
 
-    def _analysis_ready(self, path, entries, candidates):
+    def _analysis_ready(self, path, entries, candidates, included_entries, included_candidates):
         project = self.project
         if project is None or not project.exists() or not project.is_dir():
             QMessageBox.warning(self, "No project",
                                 "Select a project folder first.")
             return
-        if not candidates:
+        detection_candidates = candidates or included_candidates
+        if not detection_candidates:
             QMessageBox.warning(self, "No usable structure",
                                 "The ZIP does not contain any safe file paths that can be mapped into this project.")
             return
-        best = candidates[0]
-        ties = [c for c in candidates if (
+        best = detection_candidates[0]
+        ties = [c for c in detection_candidates if (
             c.considered_count, c.unchanged_count, c.mapped_count, round(
                 c.score, 6)
         ) == (
@@ -592,19 +601,29 @@ class MainWindow(QMainWindow):
             self._set_status("Waiting for another archive")
             return
         try:
-            plan = make_plan(entries, best.prefix, project)
-            plan = enrich_plan_hashes(path, plan)
+            plan = enrich_plan_hashes(
+                path, make_plan(entries, best.prefix, project)
+            )
+            included_plan = enrich_plan_hashes(
+                path, make_plan(included_entries, best.prefix, project)
+            )
+            filtered_archive_paths = {item.archive_path for item in plan}
+            gitignored_plan = [
+                item for item in included_plan
+                if item.archive_path not in filtered_archive_paths
+            ]
         except Exception as exc:
             QMessageBox.critical(self, "Unsafe import", str(exc))
             self._set_status("Import could not be prepared", error=True)
             return
-        if not plan:
+        if not included_plan:
             QMessageBox.warning(self, "Nothing to import",
                                 "No files were found after the detected ZIP root.")
             self._set_status("Nothing to import")
             return
         dialog = ImportPreviewDialog(
-            project, project.name, best.prefix, plan, path, self)
+            project, project.name, best.prefix, plan, included_plan,
+            gitignored_plan, path, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             self._set_status("Import cancelled")
             self._pending_zip = None

@@ -18,12 +18,14 @@ A small PySide6 Windows utility for dropping LLM-generated ZIPs onto a selected 
 - Never delete project files merely because they are absent from the ZIP.
 - Keep a local import history.
 - Run archive analysis in a worker thread so the UI stays responsive.
+- Exclude files matched by Git ignore rules by default, with an option to include them.
 
 ## Requirements
 
 - Windows 10/11
 - Python 3.10+
 - PySide6
+- Git (used when available for Git ignore-rule matching)
 
 Install:
 
