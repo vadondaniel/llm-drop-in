@@ -5,15 +5,16 @@ from pathlib import Path
 from PySide6.QtCore import QObject, QThread, Qt, Signal
 from PySide6.QtGui import QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
-    QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
+    QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
     QMessageBox, QPushButton, QVBoxLayout, QWidget, QListWidget, QListWidgetItem,
-    QDialog, QProgressBar, QAbstractItemView, QScrollBar, QComboBox,
+    QDialog, QProgressBar, QAbstractItemView, QComboBox,
 )
 
 from core.importer import apply_import, cleanup_orphaned_transactions, enrich_plan_hashes, history_entry, make_plan, undo_import
 from core.settings import add_history, load_history, load_settings, save_settings, update_history_entry, remember_project
 from core.zip_analyzer import analyze_variants
 from ui.import_preview import ImportPreviewDialog
+from ui.theme import apply_theme, set_style_class
 
 
 class ZipWorker(QObject):
@@ -72,6 +73,7 @@ class DropArea(QFrame):
         self.callback = callback
         self.setAcceptDrops(True)
         self.setObjectName("DropArea")
+        set_style_class(self, "drop-area")
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 28, 24, 28)
@@ -79,9 +81,11 @@ class DropArea(QFrame):
 
         self.title = QLabel("Drop an LLM ZIP here")
         self.title.setObjectName("DropTitle")
+        set_style_class(self.title, "drop-title")
         self.title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.hint = QLabel("or click to browse for a .zip archive")
         self.hint.setObjectName("DropHint")
+        set_style_class(self.hint, "hint")
         self.hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         layout.addStretch()
@@ -128,6 +132,10 @@ class MainWindow(QMainWindow):
         self._pending_plan = None
         self._cleanup_stale_transactions()
         self._build()
+        app = QApplication.instance()
+        if isinstance(app, QApplication):
+            app.paletteChanged.connect(self._theme_changed)
+        self._theme_changed()
         self._refresh()
 
     @staticmethod
@@ -194,9 +202,11 @@ class MainWindow(QMainWindow):
         title_block.setSpacing(3)
         title = QLabel("LLM Drop-In")
         title.setObjectName("WindowTitle")
+        set_style_class(title, "title")
         subtitle = QLabel(
             "Review generated changes before they touch your project.")
         subtitle.setObjectName("WindowSubtitle")
+        set_style_class(subtitle, "subtitle")
         title_block.addWidget(title)
         title_block.addWidget(subtitle)
         header.addLayout(title_block, 1)
@@ -213,21 +223,25 @@ class MainWindow(QMainWindow):
 
         project_card = QFrame()
         project_card.setObjectName("SectionCard")
+        set_style_class(project_card, "surface")
         project_layout = QVBoxLayout(project_card)
         project_layout.setContentsMargins(18, 16, 18, 16)
         project_layout.setSpacing(10)
         project_header = QHBoxLayout()
         project_title = QLabel("Project")
         project_title.setObjectName("CardTitle")
+        set_style_class(project_title, "card-title")
         project_header.addWidget(project_title)
         project_header.addStretch()
         project_hint = QLabel("The ZIP is matched against this folder.")
         project_hint.setObjectName("CardHint")
+        set_style_class(project_hint, "hint")
         project_header.addWidget(project_hint)
         project_layout.addLayout(project_header)
         project_row = QHBoxLayout()
         project_row.setSpacing(10)
         self.project_picker = QComboBox()
+        set_style_class(self.project_picker, "input")
         self.project_picker.setMinimumHeight(40)
         self.project_picker.setPlaceholderText("No recent project")
         self.project_picker.currentIndexChanged.connect(
@@ -235,6 +249,7 @@ class MainWindow(QMainWindow):
         project_row.addWidget(self.project_picker, 1)
         choose = QPushButton("Choose folder")
         choose.setObjectName("SecondaryButton")
+        set_style_class(choose, "secondary-button")
         choose.setMinimumHeight(40)
         choose.clicked.connect(self.choose_project)
         project_row.addWidget(choose)
@@ -244,17 +259,20 @@ class MainWindow(QMainWindow):
 
         import_card = QFrame()
         import_card.setObjectName("SectionCard")
+        set_style_class(import_card, "surface")
         import_layout = QVBoxLayout(import_card)
         import_layout.setContentsMargins(18, 16, 18, 16)
         import_layout.setSpacing(10)
         import_header = QHBoxLayout()
         import_title = QLabel("Import")
         import_title.setObjectName("CardTitle")
+        set_style_class(import_title, "card-title")
         import_header.addWidget(import_title)
         import_header.addStretch()
         import_hint = QLabel(
             "Drop a ZIP to inspect it before applying anything.")
         import_hint.setObjectName("CardHint")
+        set_style_class(import_hint, "hint")
         import_header.addWidget(import_hint)
         import_layout.addLayout(import_header)
         self.drop = DropArea(self.receive_zip)
@@ -269,12 +287,15 @@ class MainWindow(QMainWindow):
         status_layout.setSpacing(9)
         self.status_dot = QLabel("●")
         self.status_dot.setObjectName("StatusDot")
+        set_style_class(self.status_dot, "status-dot")
         status_layout.addWidget(self.status_dot)
         self.status = QLabel("Select a project folder to get started.")
         self.status.setObjectName("AppStatus")
+        set_style_class(self.status, "app-status")
         self.status.setWordWrap(True)
         status_layout.addWidget(self.status, 1)
         self.progress = QProgressBar()
+        set_style_class(self.progress, "progress")
         self.progress.setRange(0, 0)
         self.progress.setFixedHeight(4)
         self.progress.setTextVisible(False)
@@ -285,6 +306,7 @@ class MainWindow(QMainWindow):
 
         history_card = QFrame()
         history_card.setObjectName("HistorySidebar")
+        set_style_class(history_card, "surface-sidebar")
         history_card.setMinimumWidth(290)
         history_card.setMaximumWidth(360)
         history_layout = QVBoxLayout(history_card)
@@ -295,15 +317,18 @@ class MainWindow(QMainWindow):
         history_header.setSpacing(2)
         history_title = QLabel("Recent imports")
         history_title.setObjectName("CardTitle")
+        set_style_class(history_title, "card-title")
         history_header.addWidget(history_title)
         history_hint = QLabel(
             "Imports for the current project.")
         history_hint.setObjectName("CardHint")
+        set_style_class(history_hint, "hint")
         history_hint.setWordWrap(True)
         history_header.addWidget(history_hint)
         history_layout.addLayout(history_header)
 
         self.history = QListWidget()
+        set_style_class(self.history, "list")
         self.history.itemSelectionChanged.connect(
             self._history_selection_changed)
         # Double-click intentionally has no destructive action.
@@ -320,10 +345,12 @@ class MainWindow(QMainWindow):
 
         self.history_summary = QLabel("No imports yet")
         self.history_summary.setObjectName("HistorySummary")
+        set_style_class(self.history_summary, "subtle")
         history_layout.addWidget(self.history_summary)
 
         self.undo = QPushButton("Undo selected import")
         self.undo.setObjectName("SecondaryButton")
+        set_style_class(self.undo, "secondary-button")
         self.undo.setMinimumHeight(38)
         self.undo.setEnabled(False)
         self.undo.clicked.connect(self._undo_history_item)
@@ -333,104 +360,21 @@ class MainWindow(QMainWindow):
         body_layout.addWidget(history_card, 0)
         layout.addWidget(body, 1)
 
-        self.setStyleSheet("""
-            QMainWindow { background: #f4f6f7; }
-            QWidget { color: #1f272d; font-size: 10pt; }
-            QFrame#SectionCard, QFrame#HistorySidebar {
-                background: #ffffff;
-                border: 1px solid #dce2e5;
-                border-radius: 13px;
-            }
-            QFrame#HistorySidebar {
-                min-width: 290px;
-            }
-            QLabel#WindowTitle { font-size: 22pt; font-weight: 700; color: #172027; }
-            QLabel#WindowSubtitle { color: #707a82; font-size: 10pt; }
-            QLabel#CardTitle { font-size: 11pt; font-weight: 700; color: #273238; }
-            QLabel#CardHint, QLabel#DropHint { color: #778188; }
-            QLabel#InlineStatus { color: #4f5b61; }
-            QLabel#HistorySummary { color: #7a848b; }
-            QLabel#StatusDot { color: #4b967f; font-size: 8pt; }
-            QLabel#AppStatus { color: #5d676e; }
-            QFrame#AppStatusBar { background: transparent; }
-            QLineEdit, QComboBox {
-                background: #fbfcfc;
-                border: 1px solid #d5dde0;
-                border-radius: 8px;
-                padding: 7px 10px;
-                selection-background-color: #dcefe9;
-                selection-color: #17211f;
-            }
-            QLineEdit:focus, QComboBox:focus { border: 1px solid #6d9f93; }
-            QComboBox::drop-down { border: none; width: 28px; }
-            QComboBox QAbstractItemView {
-                background: #ffffff;
-                border: 1px solid #d5dde0;
-                selection-background-color: #e8f3f0;
-                selection-color: #17211f;
-                padding: 4px;
-            }
-            QPushButton {
-                background: #276b5f;
-                color: white;
-                border: none;
-                border-radius: 8px;
-                padding: 8px 14px;
-                font-weight: 700;
-            }
-            QPushButton:hover { background: #215b51; }
-            QPushButton:pressed { background: #1b4e46; }
-            QPushButton:disabled { background: #d9dddf; color: #8a9298; }
-            QPushButton#SecondaryButton {
-                background: #f0f3f4;
-                color: #30393f;
-                border: 1px solid #d6dde0;
-            }
-            QPushButton#SecondaryButton:hover { background: #e7ebed; }
-            QFrame#DropArea {
-                background: #fbfdfc;
-                border: 1.5px dashed #8eb8ad;
-                border-radius: 12px;
-            }
-            QFrame#DropArea:hover { background: #f3faf8; border-color: #5d9588; }
-            QLabel#DropTitle { font-size: 13pt; font-weight: 700; color: #2d6256; }
-            QListWidget {
-                background: #fbfcfc;
-                border: 1px solid #e1e6e8;
-                border-radius: 9px;
-                padding: 2px;
-                outline: none;
-            }
-            QListWidget::item {
-                padding: 10px 9px;
-                border-bottom: 1px solid #edf0f1;
-            }
-            QListWidget::item:selected {
-                background: #e8f3f0;
-                color: #17211f;
-                border-radius: 6px;
-            }
-            QScrollBar:vertical {
-                background: #f3f5f6;
-                width: 12px;
-                margin: 3px 2px 3px 2px;
-                border-radius: 6px;
-            }
-            QScrollBar::handle:vertical {
-                background: #b4c2c7;
-                min-height: 24px;
-                border-radius: 6px;
-            }
-            QScrollBar::handle:vertical:hover { background: #95a6ad; }
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical,
-            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
-                background: none;
-                border: none;
-                height: 0px;
-            }
-            QProgressBar { background: transparent; border: none; border-radius: 3px; }
-            QProgressBar::chunk { background: #5b9a8b; border-radius: 3px; }
-        """)
+    def _theme_changed(self, _palette=None):
+        self._theme_tokens = apply_theme(self)
+        self._apply_status_dot_style(self._theme_tokens)
+
+    def _apply_status_dot_style(self, tokens):
+        style_class = self.status_dot.property("styleClass")
+        if style_class == "status-dot-error":
+            color = tokens.danger_fg
+        elif style_class == "status-dot-active":
+            color = tokens.info_fg
+        else:
+            color = tokens.success_fg
+        palette = self.status_dot.palette()
+        palette.setColor(palette.ColorRole.WindowText, color)
+        self.status_dot.setPalette(palette)
 
     def _cleanup_stale_transactions(self):
         history = load_history()
@@ -469,11 +413,14 @@ class MainWindow(QMainWindow):
     def _set_status(self, text: str, *, active: bool = False, error: bool = False):
         self.status.setText(text)
         if error:
-            self.status_dot.setStyleSheet("color:#bd5a5a;font-size:8pt;")
+            set_style_class(self.status_dot, "status-dot-error")
         elif active:
-            self.status_dot.setStyleSheet("color:#6b8fb2;font-size:8pt;")
+            set_style_class(self.status_dot, "status-dot-active")
         else:
-            self.status_dot.setStyleSheet("color:#4b967f;font-size:8pt;")
+            set_style_class(self.status_dot, "status-dot")
+        tokens = getattr(self, "_theme_tokens", None)
+        if tokens is not None:
+            self._apply_status_dot_style(tokens)
 
     def _refresh(self):
         if self.project and self.project.exists() and self.project.is_dir():
