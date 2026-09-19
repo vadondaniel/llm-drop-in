@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QLabel,
     QListWidget,
+    QSizePolicy,
     QToolTip,
     QVBoxLayout,
     QWidget,
@@ -64,6 +65,28 @@ class _TooltipPopup(QFrame):
     def set_text(self, text: str, font) -> None:
         self.label.setFont(font)
         self.label.setText(text)
+
+        # QLabel keeps the minimum/maximum width imposed by setFixedWidth().
+        # Clear those constraints before measuring each new tooltip; otherwise
+        # a previously large tooltip can force every subsequent short tooltip
+        # to retain that width.
+        self.label.setMinimumWidth(0)
+        self.label.setMaximumWidth(16777215)
+        self.label.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred
+        )
+        self.label.setWordWrap(False)
+
+        # Measure the unwrapped content first. Only genuinely long content is
+        # constrained and wrapped.
+        natural_width = self.label.sizeHint().width()
+
+        if natural_width > self.CONTENT_MAX_WIDTH:
+            self.label.setFixedWidth(self.CONTENT_MAX_WIDTH)
+            self.label.setWordWrap(True)
+        else:
+            self.label.setFixedWidth(natural_width)
+
         self.label.adjustSize()
         self.adjustSize()
 
