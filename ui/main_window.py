@@ -689,9 +689,6 @@ class MainWindow(QMainWindow):
         self.download_folder.setReadOnly(True)
         self.download_folder.setMinimumHeight(34)
         set_style_class(self.download_folder, "input")
-        self.download_folder.setToolTip(
-            "Folder watched for newly downloaded ZIP files."
-        )
         self.download_folder.setText(
             str(self.settings.get("download_folder")
                 or (Path.home() / "Downloads"))
@@ -702,8 +699,6 @@ class MainWindow(QMainWindow):
         self.download_folder_button.setObjectName("SecondaryButton")
         set_style_class(self.download_folder_button, "secondary-button")
         self.download_folder_button.setMinimumHeight(34)
-        self.download_folder_button.setToolTip(
-            "Choose the folder to monitor for downloaded ZIPs.")
         self.download_folder_button.clicked.connect(
             self._choose_download_folder)
         monitor_row.addWidget(self.download_folder_button)

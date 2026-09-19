@@ -219,6 +219,16 @@ class StyledToolTipController(QObject):
             self._hide()
             return
 
+        # Native popup widgets such as QMenu own the interaction while they
+        # are open. Do not leave a tooltip from the widget that opened the
+        # popup hanging underneath the popup, and do not try to show new
+        # tooltips for popup contents unless they explicitly participate in
+        # the app tooltip system later.
+        popup = self.app.activePopupWidget()
+        if popup is not None and popup is not self._tooltip:
+            self._hide()
+            return
+
         target, text = self._resolve_target(QCursor.pos())
         if target is None or not text:
             if self._visible_target is not None or self._pending_target is not None:
