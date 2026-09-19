@@ -6,7 +6,6 @@ from pathlib import Path
 
 APP_DIR = Path.home() / "AppData" / "Local" / "LLM-Drop-In"
 SETTINGS_FILE = APP_DIR / "settings.json"
-HISTORY_FILE = APP_DIR / "history.json"
 TRANSACTION_DIR = APP_DIR / "transactions"
 
 
@@ -65,28 +64,3 @@ def remember_project(settings: dict, project: Path, limit: int = 15) -> None:
 def save_settings(settings: dict) -> None:
     APP_DIR.mkdir(parents=True, exist_ok=True)
     SETTINGS_FILE.write_text(json.dumps(settings, indent=2), encoding="utf-8")
-
-
-def load_history() -> list[dict]:
-    return _load(HISTORY_FILE, [])
-
-
-def add_history(entry: dict, limit: int = 30) -> list[dict]:
-    history = load_history()
-    history.insert(0, entry)
-    kept = history[:limit]
-    APP_DIR.mkdir(parents=True, exist_ok=True)
-    HISTORY_FILE.write_text(json.dumps(kept, indent=2), encoding="utf-8")
-    return kept
-
-
-def update_history_entry(history_id: str, **changes) -> bool:
-    history = load_history()
-    for entry in history:
-        if entry.get("id") == history_id:
-            entry.update(changes)
-            APP_DIR.mkdir(parents=True, exist_ok=True)
-            HISTORY_FILE.write_text(json.dumps(
-                history, indent=2), encoding="utf-8")
-            return True
-    return False

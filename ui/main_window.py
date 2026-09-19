@@ -3,18 +3,26 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
+from typing import Protocol, cast
 
-from PySide6.QtCore import QObject, QThread, Qt, Signal, QMimeData, QUrl, QPoint, QTimer
-from PySide6.QtGui import QAction, QDrag, QDragEnterEvent, QDropEvent, QMouseEvent
+from PySide6.QtCore import QObject, QThread, Qt, Signal, QMimeData, QUrl, QPoint, QTimer, QRect, QSize
+from PySide6.QtGui import QAction, QDrag, QDragEnterEvent, QDropEvent, QMouseEvent, QPainter, QPen, QFont, QFontMetrics
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
     QMessageBox, QPushButton, QVBoxLayout, QWidget, QListWidget, QListWidgetItem,
-    QDialog, QProgressBar, QAbstractItemView, QComboBox, QMenu,
+    QDialog, QProgressBar, QAbstractItemView, QComboBox, QMenu, QStyledItemDelegate, QStyle, QStyleOptionViewItem,
 )
 
 from core.download_monitor import DownloadFolderMonitor
-from core.importer import apply_import, cleanup_orphaned_transactions, history_entry, make_plan, undo_import
-from core.settings import add_history, load_history, load_settings, save_settings, update_history_entry, remember_project
+from core.importer import apply_import, cleanup_orphaned_transactions, make_plan, undo_import
+from core.import_history import (
+    HistoryEntry,
+    get_history_for_project,
+    mark_undo_unavailable,
+    reconcile_import_history,
+    record_undo_failure,
+)
+from core.settings import load_settings, save_settings, remember_project
 from core.zip_analyzer import (
     ImportAnalysis, ProjectMatchHandling, ProjectMatchLevel, assess_project_match,
     analyze_for_import, project_match_handling,
@@ -31,6 +39,206 @@ from core.packer import (
 from ui.import_preview import ImportPreviewDialog
 from ui.theme import apply_theme, set_style_class
 from ui.formatting import format_bytes
+
+
+class _PaintOption(Protocol):
+    rect: QRect
+    state: QStyle.StateFlag
+    font: QFont
+
+
+class HistoryItemDelegate(QStyledItemDelegate):
+    """Compact, two-line presentation for a recent-import history entry."""
+
+    _ROW_HEIGHT = 72
+    _ROW_HEIGHT_WITH_SOURCE_WARNING = 88
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._tokens = None
+
+    def set_tokens(self, tokens) -> None:
+        self._tokens = tokens
+
+    @staticmethod
+    def _timestamp(entry: HistoryEntry) -> str:
+        return datetime.fromisoformat(entry.created_at).astimezone().strftime("%d %b · %H:%M")
+
+    @staticmethod
+    def _exact_timestamp(entry: HistoryEntry) -> str:
+        return datetime.fromisoformat(entry.created_at).astimezone().strftime("%d %b %Y, %H:%M:%S")
+
+    @staticmethod
+    def _status(entry: HistoryEntry) -> tuple[str, str]:
+        if entry.state == "UNDONE":
+            return "Undone", "neutral"
+        if entry.is_noop:
+            return "No changes", "info"
+        if entry.undo_state == "AVAILABLE":
+            return "Undo available", "success"
+        if entry.undo_state == "FAILED":
+            return "Undo failed", "danger"
+        return "Undo unavailable", "warning"
+
+    @staticmethod
+    def _counts(entry: HistoryEntry) -> str:
+        return (
+            f"{entry.file_count:,} files · "
+            f"{entry.replaced_count:,} modified · "
+            f"{entry.new_count:,} new · "
+            f"{entry.unchanged_count:,} unchanged"
+        )
+
+    def sizeHint(self, option, index) -> QSize:  # noqa: N802 - Qt API
+        entry = index.data(Qt.ItemDataRole.UserRole)
+        if isinstance(entry, HistoryEntry):
+            source_missing = not (
+                entry.source_zip_path and Path(entry.source_zip_path).is_file()
+            )
+            return QSize(0, self._ROW_HEIGHT_WITH_SOURCE_WARNING if source_missing else self._ROW_HEIGHT)
+        return QSize(0, self._ROW_HEIGHT)
+
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index) -> None:  # noqa: N802 - Qt API
+        entry = index.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(entry, HistoryEntry):
+            super().paint(painter, option, index)
+            return
+
+        tokens = self._tokens
+        if tokens is None:
+            super().paint(painter, option, index)
+            return
+
+        paint_option = cast(_PaintOption, option)
+
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        rect = paint_option.rect.adjusted(4, 3, -4, -3)
+        selected = bool(paint_option.state & QStyle.StateFlag.State_Selected)
+        hovered = bool(paint_option.state & QStyle.StateFlag.State_MouseOver)
+
+        if selected:
+            background = tokens.accent_soft
+            border = tokens.accent
+        elif hovered:
+            background = tokens.surface_alt
+            border = tokens.border_strong
+        else:
+            background = tokens.surface_alt
+            border = tokens.border
+
+        painter.setBrush(background)
+        painter.setPen(QPen(border, 1))
+        painter.drawRoundedRect(rect, 8, 8)
+
+        left = rect.left() + 12
+        right = rect.right() - 12
+        top = rect.top() + 8
+
+        name_font = QFont(paint_option.font)
+        name_font.setBold(True)
+        name_metrics = QFontMetrics(name_font)
+        painter.setFont(name_font)
+        painter.setPen(tokens.text)
+
+        timestamp = self._timestamp(entry)
+        time_font = QFont(paint_option.font)
+        time_font.setPointSizeF(max(8.0, time_font.pointSizeF() - 1.0))
+        time_metrics = QFontMetrics(time_font)
+        time_width = time_metrics.horizontalAdvance(timestamp)
+        time_rect = QRect(right - time_width, top,
+                          time_width, name_metrics.height())
+
+        name_width = max(30, time_rect.left() - left - 12)
+        name_rect = QRect(left, top, name_width, name_metrics.height())
+        name_text = name_metrics.elidedText(
+            entry.source_zip_name,
+            Qt.TextElideMode.ElideMiddle,
+            name_rect.width(),
+        )
+        painter.drawText(name_rect, Qt.AlignmentFlag.AlignLeft |
+                         Qt.AlignmentFlag.AlignVCenter, name_text)
+
+        painter.setFont(time_font)
+        painter.setPen(tokens.text_subtle)
+        painter.drawText(time_rect, Qt.AlignmentFlag.AlignRight |
+                         Qt.AlignmentFlag.AlignVCenter, timestamp)
+
+        meta_font = QFont(paint_option.font)
+        meta_font.setPointSizeF(max(8.0, meta_font.pointSizeF() - 1.0))
+        meta_metrics = QFontMetrics(meta_font)
+        painter.setFont(meta_font)
+        painter.setPen(tokens.text_subtle)
+
+        status_text, status_tone = self._status(entry)
+        status_map = {
+            "success": (tokens.success_bg, tokens.success_fg),
+            "danger": (tokens.danger_bg, tokens.danger_fg),
+            "warning": (tokens.warning_bg, tokens.warning_fg),
+            "info": (tokens.info_bg, tokens.info_fg),
+            "neutral": (tokens.neutral_bg, tokens.neutral_fg),
+        }
+        status_bg, status_fg = status_map[status_tone]
+        status_width = meta_metrics.horizontalAdvance(status_text) + 18
+        status_rect = QRect(
+            right - status_width,
+            top + name_metrics.height() + 9,
+            status_width,
+            meta_metrics.height() + 6,
+        )
+        painter.setBrush(status_bg)
+        painter.setPen(QPen(status_fg, 1))
+        painter.drawRoundedRect(status_rect, 7, 7)
+        painter.setPen(status_fg)
+        painter.drawText(
+            status_rect.adjusted(9, 0, -9, 0),
+            Qt.AlignmentFlag.AlignCenter,
+            status_text,
+        )
+
+        counts = self._counts(entry)
+        counts_right = status_rect.left() - 10
+        counts_rect = QRect(
+            left,
+            top + name_metrics.height() + 9,
+            max(24, counts_right - left),
+            meta_metrics.height() + 6,
+        )
+        counts_text = meta_metrics.elidedText(
+            counts,
+            Qt.TextElideMode.ElideRight,
+            counts_rect.width(),
+        )
+        painter.setPen(tokens.text_muted)
+        painter.drawText(
+            counts_rect,
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            counts_text,
+        )
+
+        source_missing = not (
+            entry.source_zip_path and Path(entry.source_zip_path).is_file()
+        )
+        if source_missing:
+            warning_font = QFont(meta_font)
+            warning_font.setItalic(True)
+            warning_metrics = QFontMetrics(warning_font)
+            painter.setFont(warning_font)
+            painter.setPen(tokens.warning_fg)
+            warning_rect = QRect(
+                left,
+                status_rect.bottom() + 2,
+                right - left,
+                warning_metrics.height(),
+            )
+            painter.drawText(
+                warning_rect,
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                "Source ZIP unavailable; history retained",
+            )
+
+        painter.restore()
 
 
 class ZipWorker(QObject):
@@ -788,8 +996,23 @@ class MainWindow(QMainWindow):
         self.history.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.history.setUniformItemSizes(False)
+        self.history.setWordWrap(False)
         self.history.setMouseTracking(True)
+        self.history.setSpacing(2)
+        self.history.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu)
+        self.history.customContextMenuRequested.connect(
+            self._history_context_menu)
+        self.history_delegate = HistoryItemDelegate(self.history)
+        self.history.setItemDelegate(self.history_delegate)
         history_layout.addWidget(self.history, 1)
+
+        self.history_empty = QLabel("No recent imports for this project.")
+        self.history_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.history_empty.setWordWrap(True)
+        self.history_empty.setMinimumHeight(40)
+        set_style_class(self.history_empty, "subtle")
+        history_layout.addWidget(self.history_empty)
 
         self.undo = QPushButton("Undo selected import")
         self.undo.setObjectName("SecondaryButton")
@@ -808,6 +1031,9 @@ class MainWindow(QMainWindow):
 
     def _theme_changed(self, _palette=None):
         self._theme_tokens = apply_theme(self)
+        if hasattr(self, "history_delegate"):
+            self.history_delegate.set_tokens(self._theme_tokens)
+            self.history.viewport().update()
         app = QApplication.instance()
         tooltip_controller = app.property(
             "tooltipController") if app is not None else None
@@ -828,38 +1054,13 @@ class MainWindow(QMainWindow):
         self.status_dot.setPalette(palette)
 
     def _cleanup_stale_transactions(self):
-        history = load_history()
-        active_ids = {
-            entry.get("transaction_id")
-            for entry in history
-            if isinstance(entry, dict) and entry.get("transaction_id") and not entry.get("undone")
-        }
-        cleanup_orphaned_transactions({str(value)
-                                      for value in active_ids if value})
+        active_ids = reconcile_import_history()
+        cleanup_orphaned_transactions(active_ids)
 
-    def _current_project_key(self) -> str | None:
+    def _history_for_current_project(self) -> list[HistoryEntry]:
         if self.project is None or not self._valid_project(self.project):
-            return None
-        return str(self.project.resolve()).casefold()
-
-    def _history_for_current_project(self) -> list[dict]:
-        project_key = self._current_project_key()
-        if project_key is None:
             return []
-        result = []
-        for entry in load_history():
-            if not isinstance(entry, dict):
-                continue
-            raw_project = entry.get("project")
-            if not isinstance(raw_project, str) or not raw_project:
-                continue
-            try:
-                entry_key = str(Path(raw_project).resolve()).casefold()
-            except OSError:
-                continue
-            if entry_key == project_key:
-                result.append(entry)
-        return result
+        return get_history_for_project(self.project)
 
     def _set_status(self, text: str, *, active: bool = False, error: bool = False):
         self.status.setText(text)
@@ -887,28 +1088,75 @@ class MainWindow(QMainWindow):
             self._refresh_recent_projects()
             if not self.progress.isVisible():
                 self._set_status("Select a project folder to get started.")
+        self._refresh_import_history()
+
+    def _refresh_import_history(self):
+        selected_id = None
+        current = self.history.currentItem() if hasattr(self, "history") else None
+        current_entry = current.data(
+            Qt.ItemDataRole.UserRole) if current else None
+        if isinstance(current_entry, HistoryEntry):
+            selected_id = current_entry.id
+
         self.history.clear()
-        entries = self._history_for_current_project()[:15]
-        for entry in entries:
-            ts = entry.get("timestamp", "").replace("T", " ")
-            name = Path(entry.get("zip", "")).name
-            counts = (
-                f"{entry.get('files', 0)} files · "
-                f"{entry.get('replaced', 0)} modified · "
-                f"{entry.get('new', 0)} new · "
-                f"{entry.get('unchanged', 0)} unchanged"
-            )
-            state = "UNDONE" if entry.get("undone") else "COMPLETED"
-            msg = f"{name}\n{counts}  ·  {ts}  ·  {state}"
-            item = QListWidgetItem(msg)
-            item.setToolTip(
-                f"<b>{escape(name)}</b><br>"
-                f"{escape(counts)}<br>"
-                f"{escape(ts)} · {escape(state)}"
-            )
-            item.setData(Qt.ItemDataRole.UserRole, entry)
+        entries = self._history_for_current_project()
+        self.history_empty.setVisible(not entries)
+        selected_row = -1
+        for row_index, entry in enumerate(entries):
+            item = self._make_history_item(entry)
             self.history.addItem(item)
+            if entry.id == selected_id:
+                selected_row = row_index
+        if selected_row >= 0:
+            self.history.setCurrentRow(selected_row)
+        elif entries:
+            self.history.clearSelection()
         self._history_selection_changed()
+
+    def _make_history_item(self, entry: HistoryEntry) -> QListWidgetItem:
+        item = QListWidgetItem(entry.source_zip_name)
+        counts = HistoryItemDelegate._counts(entry)
+        status_text, _status_tone = HistoryItemDelegate._status(entry)
+        timestamp = HistoryItemDelegate._exact_timestamp(entry)
+        source_path = entry.source_zip_path or "(source path unavailable)"
+        source_missing = bool(entry.source_zip_path) and not Path(
+            entry.source_zip_path).is_file()
+
+        tooltip = (
+            f"<b>{escape(entry.source_zip_name)}</b><br>"
+            f"{escape(counts)}<br>"
+            f"{escape(timestamp)} · {escape(status_text)}<br>"
+            f"{escape(source_path)}"
+        )
+        if source_missing:
+            tooltip += "<br>Source ZIP is no longer available; history is retained."
+        item.setToolTip(tooltip)
+        item.setData(Qt.ItemDataRole.UserRole, entry)
+        return item
+
+    def _history_context_menu(self, position):
+        item = self.history.itemAt(position)
+        if item is None:
+            return
+        self.history.setCurrentItem(item)
+        entry = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(entry, HistoryEntry):
+            return
+
+        menu = QMenu(self)
+        undo_action = menu.addAction("Undo import")
+        undo_action.setEnabled(entry.can_undo and self.worker_thread is None)
+        if entry.state == "UNDONE":
+            undo_action.setText("Undo import (already undone)")
+        elif entry.is_noop:
+            undo_action.setText("Undo import (no file changes)")
+            undo_action.setEnabled(False)
+        elif entry.undo_state == "FAILED":
+            undo_action.setText("Undo import (previous attempt failed)")
+        elif entry.undo_state != "AVAILABLE":
+            undo_action.setText("Undo import (undo data unavailable)")
+        undo_action.triggered.connect(self._undo_history_item)
+        menu.exec(self.history.viewport().mapToGlobal(position))
 
     def _restore_latest_package(self):
         project = self.project
@@ -928,8 +1176,7 @@ class MainWindow(QMainWindow):
     def _history_selection_changed(self):
         row = self.history.currentItem()
         entry = row.data(Qt.ItemDataRole.UserRole) if row else None
-        can_undo = isinstance(entry, dict) and not entry.get(
-            "undone") and bool(entry.get("transaction_id"))
+        can_undo = isinstance(entry, HistoryEntry) and entry.can_undo
         self.undo.setEnabled(can_undo and self.worker_thread is None)
 
     def _clear_package_artifact(self):
@@ -983,6 +1230,7 @@ class MainWindow(QMainWindow):
         self.worker_thread.started.connect(self.worker.run)
         self.worker.finished.connect(self.worker_thread.quit)
         self.worker_thread.finished.connect(self._worker_finished)
+        self._history_selection_changed()
         self.worker_thread.start()
 
     def _package_succeeded(self, result: PackageResult):
@@ -1070,6 +1318,7 @@ class MainWindow(QMainWindow):
         self.worker.failed.connect(self._analysis_failed)
         self.worker.finished.connect(self.worker_thread.quit)
         self.worker_thread.finished.connect(self._worker_finished)
+        self._history_selection_changed()
         self.worker_thread.start()
 
     def _worker_finished(self):
@@ -1244,16 +1493,15 @@ class MainWindow(QMainWindow):
         self.worker.failed.connect(self._import_failed)
         self.worker.finished.connect(self.worker_thread.quit)
         self.worker_thread.finished.connect(self._worker_finished)
+        self._history_selection_changed()
         self.worker_thread.start()
 
     def _import_succeeded(self, applied: int, transaction_id):
         path = self._pending_zip
         plan = self._pending_plan or []
         if path and self.project:
-            add_history(history_entry(path, self.project,
-                        plan, transaction_id=transaction_id))
             self._cleanup_stale_transactions()
-            self._refresh()
+            self._refresh_import_history()
             self._set_status(f"Imported {applied} files from {path.name}")
         self._pending_zip = None
         self._pending_plan = None
@@ -1266,10 +1514,10 @@ class MainWindow(QMainWindow):
         if row is None:
             return
         entry = row.data(Qt.ItemDataRole.UserRole)
-        if not isinstance(entry, dict) or entry.get("undone"):
+        if not isinstance(entry, HistoryEntry) or not entry.can_undo:
             return
-        transaction_id = entry.get("transaction_id")
-        if not isinstance(transaction_id, str) or not transaction_id:
+        transaction_id = entry.transaction_id
+        if not transaction_id:
             return
         if QMessageBox.question(
             self,
@@ -1280,12 +1528,19 @@ class MainWindow(QMainWindow):
         try:
             restored = undo_import(transaction_id)
         except Exception as exc:
+            if isinstance(exc, ValueError) and str(exc) == "Import transaction no longer exists.":
+                mark_undo_unavailable(entry.id)
+                status = "Undo data is no longer available"
+            else:
+                record_undo_failure(entry.id)
+                status = "Undo failed; the import remains applied"
             QMessageBox.critical(self, "Cannot undo import", str(exc))
-            self._set_status("Undo failed", error=True)
+            self._cleanup_stale_transactions()
+            self._refresh_import_history()
+            self._set_status(status, error=True)
             return
-        update_history_entry(entry.get("id", ""), undone=True)
         self._cleanup_stale_transactions()
-        self._refresh()
+        self._refresh_import_history()
         self._set_status(f"Undid import: restored {restored} files")
 
     def _import_failed(self, message: str):

@@ -8,9 +8,15 @@ import os
 import shutil
 import subprocess
 import tempfile
+import uuid
 import zipfile
-from datetime import datetime
 
+from .import_history import (
+    build_history_entry,
+    record_applied_import,
+    mark_undone,
+    has_history_entry,
+)
 from .settings import TRANSACTION_DIR
 from .zip_analyzer import ZipEntry, relative_after_prefix, validate_relative_path
 
@@ -163,6 +169,14 @@ def _transaction_dir(transaction_id: str) -> Path:
     return TRANSACTION_DIR / transaction_id
 
 
+def _persist_history_best_effort(entry) -> None:
+    try:
+        record_applied_import(entry)
+    except Exception:
+        # The transaction manifest remains the durable recovery source.
+        pass
+
+
 def _read_transaction_manifest(transaction_dir: Path) -> dict | None:
     manifest_path = transaction_dir / "manifest.json"
     if not manifest_path.is_file():
@@ -171,6 +185,21 @@ def _read_transaction_manifest(transaction_dir: Path) -> dict | None:
         return json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError):
         return None
+
+
+def _write_transaction_manifest(path: Path, manifest: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, raw_tmp = tempfile.mkstemp(
+        prefix="manifest-", suffix=".tmp", dir=path.parent)
+    tmp = Path(raw_tmp)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(manifest, fh, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _cleanup_transaction_files(manifest: dict | None) -> None:
@@ -185,6 +214,105 @@ def _cleanup_transaction_files(manifest: dict | None) -> None:
                 Path(raw).unlink(missing_ok=True)
             except OSError:
                 pass
+
+
+def _recover_interrupted_transaction(transaction_dir: Path, manifest: dict) -> bool:
+    """Recover a transaction that died before reaching a committed state.
+
+    Only restore/delete a target when its current content can be identified as
+    the imported content (or as the already-restored old content). If the file
+    has changed to something else, leave the transaction intact rather than
+    overwriting user work.
+    """
+    status = manifest.get("status")
+    if status == "undoing":
+        # An interrupted undo is intentionally resumable. Its history entry
+        # remains active and the per-file `undone` markers allow retrying it.
+        return False
+    if status == "needs_manual_recovery":
+        return False
+    if status not in {"staging", "committing"}:
+        return True
+
+    files = manifest.get("files")
+    if not isinstance(files, list):
+        return False
+
+    changed = False
+    for item in files:
+        if not isinstance(item, dict):
+            return False
+        if not (item.get("commit_started") or item.get("committed")):
+            continue
+
+        target = Path(item.get("target", ""))
+        if not target:
+            return False
+        current = (
+            _hash_file(target)
+            if target.exists() and target.is_file() and not target.is_symlink()
+            else None
+        )
+        old_hash = item.get("old_hash")
+        new_hash = item.get("new_hash")
+
+        if old_hash is not None and current == old_hash:
+            item["commit_started"] = False
+            item["committed"] = False
+            changed = True
+            continue
+        if old_hash is None and current is None and not target.exists():
+            item["commit_started"] = False
+            item["committed"] = False
+            changed = True
+            continue
+        if current != new_hash:
+            manifest["status"] = "needs_manual_recovery"
+            _write_transaction_manifest(
+                transaction_dir / "manifest.json", manifest)
+            return False
+
+        backup_raw = item.get("backup")
+        backup = Path(backup_raw) if isinstance(
+            backup_raw, str) and backup_raw else None
+        if old_hash is None:
+            if target.exists():
+                try:
+                    target.unlink()
+                except OSError:
+                    manifest["status"] = "needs_manual_recovery"
+                    _write_transaction_manifest(
+                        transaction_dir / "manifest.json", manifest)
+                    return False
+        elif backup is not None and backup.exists():
+            restore_tmp = target.parent / \
+                f".{target.name}.llm-dropin-recovery.tmp"
+            try:
+                shutil.copy2(backup, restore_tmp)
+                os.replace(restore_tmp, target)
+            except OSError:
+                restore_tmp.unlink(missing_ok=True)
+                manifest["status"] = "needs_manual_recovery"
+                _write_transaction_manifest(
+                    transaction_dir / "manifest.json", manifest)
+                return False
+            finally:
+                restore_tmp.unlink(missing_ok=True)
+        else:
+            manifest["status"] = "needs_manual_recovery"
+            _write_transaction_manifest(
+                transaction_dir / "manifest.json", manifest)
+            return False
+
+        item["commit_started"] = False
+        item["committed"] = False
+        changed = True
+
+    if changed:
+        manifest["status"] = "rolled_back"
+        _write_transaction_manifest(
+            transaction_dir / "manifest.json", manifest)
+    return True
 
 
 def cleanup_orphaned_transactions(active_ids: set[str] | None = None) -> int:
@@ -202,6 +330,8 @@ def cleanup_orphaned_transactions(active_ids: set[str] | None = None) -> int:
         if not transaction_dir.is_dir() or transaction_dir.name in active_ids:
             continue
         manifest = _read_transaction_manifest(transaction_dir)
+        if manifest and not _recover_interrupted_transaction(transaction_dir, manifest):
+            continue
         _cleanup_transaction_files(manifest)
         shutil.rmtree(transaction_dir, ignore_errors=True)
         removed += 1
@@ -217,29 +347,66 @@ def apply_import(
     """Apply an import and retain only the undo state needed by history."""
     effective_plan = [item for item in plan if item.action != "unchanged"]
     if not effective_plan:
+        if project_root is not None:
+            # Even a no-op import needs a tiny durable recovery record. There
+            # are no file backups and therefore nothing to undo, but a process
+            # can still die while the history write is in flight. Keeping the
+            # history record in a transaction manifest lets startup recover it.
+            TRANSACTION_DIR.mkdir(parents=True, exist_ok=True)
+            transaction_id = uuid.uuid4().hex
+            transaction_dir = _transaction_dir(transaction_id)
+            transaction_dir.mkdir()
+            entry = build_history_entry(
+                zip_path, project_root, plan, transaction_id=transaction_id
+            )
+            entry = replace(entry, undo_state="UNAVAILABLE")
+            manifest = {
+                "id": transaction_id,
+                "zip": str(zip_path),
+                "project": str(project_root.resolve()),
+                "history": entry.to_dict(),
+                "files": [],
+                "status": "history_only",
+            }
+            try:
+                _write_transaction_manifest(
+                    transaction_dir / "manifest.json", manifest)
+                _persist_history_best_effort(entry)
+            finally:
+                # A successfully persisted history row no longer needs the
+                # recovery manifest. If the write failed, leave it in place
+                # for startup reconciliation.
+                if has_history_entry(entry.id):
+                    shutil.rmtree(transaction_dir, ignore_errors=True)
         return 0, None
 
     _validate_current_state(effective_plan)
     TRANSACTION_DIR.mkdir(parents=True, exist_ok=True)
-    transaction_id = datetime.now().strftime("%Y%m%d%H%M%S%f")
+    transaction_id = uuid.uuid4().hex
     transaction_dir = _transaction_dir(transaction_id)
     transaction_dir.mkdir()
     committed: list[tuple[Path, Path | None]] = []
     staged_files: list[Path] = []
     backup_files: list[Path] = []
 
+    history = (
+        build_history_entry(zip_path, project_root, plan,
+                            transaction_id=transaction_id)
+        if project_root is not None
+        else None
+    )
     manifest = {
         "id": transaction_id,
         "zip": str(zip_path),
         "project": str(project_root.resolve()) if project_root else None,
+        "history": history.to_dict() if history is not None else None,
         "files": [],
+        "status": "staging",
     }
     manifest_path = transaction_dir / "manifest.json"
 
     def save_manifest() -> None:
-        manifest_path.write_text(
-            json.dumps(manifest, indent=2), encoding="utf-8"
-        )
+        _write_transaction_manifest(manifest_path, manifest)
 
     try:
         with zipfile.ZipFile(zip_path) as zf:
@@ -263,6 +430,9 @@ def apply_import(
                     "staged": str(staged),
                     "old_hash": item.old_hash,
                     "new_hash": item.new_hash,
+                    "commit_started": False,
+                    "committed": False,
+                    "undone": False,
                 })
         save_manifest()
 
@@ -281,15 +451,26 @@ def apply_import(
                 backup_files.append(backup)
                 shutil.copy2(target, backup)
             staged = Path(manifest["files"][index]["staged"])
+            manifest["files"][index]["backup"] = str(
+                backup) if backup else None
+            manifest["files"][index]["commit_started"] = True
+            manifest["status"] = "committing"
+            # Persist the intent before the replace. On a process crash between
+            # intent and replace, startup can distinguish an untouched target
+            # from a target that was already replaced.
+            save_manifest()
             os.replace(staged, target)
             staged_files.remove(staged)
             unblock_file(target)
             committed.append((target, backup))
-            manifest["files"][index]["backup"] = str(
-                backup) if backup else None
             manifest["files"][index]["staged"] = None
+            manifest["files"][index]["committed"] = True
             save_manifest()
 
+        manifest["status"] = "committed"
+        save_manifest()
+        if history is not None:
+            _persist_history_best_effort(history)
         return len(effective_plan), transaction_id
     except Exception:
         for target, backup in reversed(committed):
@@ -313,7 +494,14 @@ def undo_import(transaction_id: str) -> int:
 
     restored = 0
     files = manifest.get("files", [])
-    for item in reversed(files):
+    manifest["status"] = "undoing"
+    manifest_path = transaction_dir / "manifest.json"
+
+    def save_manifest() -> None:
+        _write_transaction_manifest(manifest_path, manifest)
+
+    for index in range(len(files) - 1, -1, -1):
+        item = files[index]
         target = Path(item["target"])
         backup = Path(item["backup"]) if item.get("backup") else None
         current = (
@@ -321,13 +509,28 @@ def undo_import(transaction_id: str) -> int:
             if target.exists() and target.is_file() and not target.is_symlink()
             else None
         )
-        if current != item.get("new_hash"):
+        old_hash = item.get("old_hash")
+        new_hash = item.get("new_hash")
+
+        already_restored = bool(item.get("undone"))
+        if not already_restored:
+            if old_hash is None:
+                already_restored = current is None and not target.exists() and not target.is_symlink()
+            else:
+                already_restored = current == old_hash
+        if already_restored:
+            if not item.get("undone"):
+                item["undone"] = True
+                save_manifest()
+            continue
+
+        if current != new_hash:
             raise RuntimeError(
                 f"Cannot undo because the file changed after import: {target}"
             )
         if backup is not None and backup.exists():
             restore_tmp = target.parent / (
-                f".{target.name}.llm-dropin-{transaction_id}-{files.index(item):08d}.tmp"
+                f".{target.name}.llm-dropin-{transaction_id}-{index:08d}.tmp"
             )
             try:
                 shutil.copy2(backup, restore_tmp)
@@ -336,23 +539,24 @@ def undo_import(transaction_id: str) -> int:
                 restore_tmp.unlink(missing_ok=True)
         elif target.exists():
             target.unlink()
+        else:
+            raise RuntimeError(
+                f"Cannot undo because the file changed after import: {target}"
+            )
+        item["undone"] = True
         restored += 1
+        save_manifest()
 
-    shutil.rmtree(transaction_dir, ignore_errors=True)
+    manifest["status"] = "undone"
+    save_manifest()
+    history_payload = manifest.get("history")
+    if isinstance(history_payload, dict):
+        history_id = history_payload.get("id")
+        if isinstance(history_id, str) and history_id:
+            try:
+                mark_undone(history_id)
+            except Exception:
+                # The manifest is authoritative recovery data if history persistence
+                # is interrupted after the undo completes.
+                pass
     return restored
-
-
-def history_entry(zip_path: Path, project_root: Path, plan: list[ImportItem], *, success: bool = True, transaction_id: str | None = None) -> dict:
-    return {
-        "id": datetime.now().strftime("%Y%m%d%H%M%S%f"),
-        "timestamp": datetime.now().isoformat(timespec="seconds"),
-        "zip": str(zip_path),
-        "project": str(project_root),
-        "files": len(plan),
-        "replaced": sum(1 for x in plan if x.action == "replace"),
-        "new": sum(1 for x in plan if x.action == "new"),
-        "unchanged": sum(1 for x in plan if x.action == "unchanged"),
-        "paths": [str(x.target_path.relative_to(project_root)) for x in plan],
-        "success": success,
-        "transaction_id": transaction_id,
-    }

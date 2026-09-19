@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import shutil
 import subprocess
 import tempfile
@@ -8,7 +10,11 @@ from unittest import mock
 import zipfile
 from pathlib import Path
 
-from core.importer import apply_import, enrich_plan_hashes, make_plan, undo_import
+import core.import_history as import_history_module
+import core.importer as importer_module
+from core.importer import (
+    apply_import, cleanup_orphaned_transactions, enrich_plan_hashes, make_plan, undo_import,
+)
 from core.settings import TRANSACTION_DIR, remember_project
 from core.zip_analyzer import (
     ProjectMatchHandling, ProjectMatchLevel, analyze, analyze_for_import,
@@ -485,6 +491,39 @@ class ImporterTests(unittest.TestCase):
             self.assertEqual(target.read_text(
                 encoding="utf-8"), "changed by user")
 
+    def test_committed_import_can_recover_history_after_history_loss(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            target = root / "existing.txt"
+            target.write_text("old", encoding="utf-8")
+            zip_path = Path(tmp) / "update.zip"
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr("existing.txt", "new")
+
+            tx_dir = Path(tmp) / "transactions"
+            history_file = Path(tmp) / "history.json"
+            app_dir = Path(tmp) / "app"
+            entries, candidates = analyze(zip_path, root)
+            plan = enrich_plan_hashes(zip_path, make_plan(
+                entries, candidates[0].prefix, root))
+            with mock.patch.object(importer_module, "TRANSACTION_DIR", tx_dir), \
+                    mock.patch.object(import_history_module, "TRANSACTION_DIR", tx_dir), \
+                    mock.patch.object(import_history_module, "APP_DIR", app_dir), \
+                    mock.patch.object(import_history_module, "HISTORY_FILE", history_file):
+                applied, transaction_id = apply_import(
+                    zip_path, plan, project_root=root)
+                self.assertEqual(applied, 1)
+                self.assertIsNotNone(transaction_id)
+                assert transaction_id is not None
+                recovered = import_history_module.reconcile_import_history()
+                self.assertIn(transaction_id, recovered)
+                history = import_history_module.load_history()
+                self.assertEqual(len(history), 1)
+                self.assertEqual(history[0].source_zip_name, "update.zip")
+                self.assertEqual(history[0].project_path, str(root.resolve()))
+                self.assertTrue(history[0].can_undo)
+
     def test_undo_restores_replaced_and_removes_new(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "project"
@@ -510,6 +549,249 @@ class ImporterTests(unittest.TestCase):
             self.assertEqual(
                 (root / "existing.txt").read_text(encoding="utf-8"), "old")
             self.assertFalse((root / "new.txt").exists())
+            manifest = json.loads(
+                (TRANSACTION_DIR / transaction_id /
+                 "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["status"], "undone")
+            self.assertTrue(all(item["undone"] for item in manifest["files"]))
+
+    def test_undo_resumes_after_a_partially_restored_transaction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            old = root / "old.txt"
+            new = root / "new.txt"
+            old.write_text("old", encoding="utf-8")
+            new.write_text("new", encoding="utf-8")
+
+            zip_path = Path(tmp) / "update.zip"
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr("old.txt", "newer")
+                zf.writestr("new.txt", "created")
+            entries, candidates = analyze(zip_path, root)
+            plan = enrich_plan_hashes(zip_path, make_plan(
+                entries, candidates[0].prefix, root))
+            applied, transaction_id = apply_import(
+                zip_path, plan, project_root=root)
+            self.assertEqual(applied, 2)
+            assert transaction_id is not None
+
+            # Simulate an interruption after the last file was restored.
+            old.write_text("newer", encoding="utf-8")
+            new.unlink()
+            manifest_path = TRANSACTION_DIR / transaction_id / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["files"][-1]["undone"] = True
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            restored = undo_import(transaction_id)
+            self.assertEqual(restored, 1)
+            self.assertEqual(old.read_text(encoding="utf-8"), "old")
+            self.assertFalse(new.exists())
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["status"], "undone")
+            self.assertTrue(all(item["undone"] for item in manifest["files"]))
+
+    def test_partial_interrupted_commit_is_rolled_back_before_orphan_cleanup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            target = root / "existing.txt"
+            target.write_text("old", encoding="utf-8")
+            tx_dir = Path(tmp) / "transactions" / "tx-partial"
+            tx_dir.mkdir(parents=True)
+            backup = tx_dir / "backup-00000000.txt.bak"
+            backup.write_text("old", encoding="utf-8")
+            target.write_text("new", encoding="utf-8")
+            manifest = {
+                "id": "tx-partial",
+                "status": "committing",
+                "files": [{
+                    "target": str(target),
+                    "backup": str(backup),
+                    "staged": None,
+                    "old_hash": importer_module._hash_file(backup),
+                    "new_hash": importer_module._hash_file(target),
+                    "commit_started": True,
+                    "committed": True,
+                    "undone": False,
+                }],
+            }
+            (tx_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+            with mock.patch.object(importer_module, "TRANSACTION_DIR", Path(tmp) / "transactions"):
+                removed = cleanup_orphaned_transactions(set())
+
+            self.assertEqual(removed, 1)
+            self.assertEqual(target.read_text(encoding="utf-8"), "old")
+            self.assertFalse(tx_dir.exists())
+
+    def test_interrupted_commit_after_intent_but_before_replace_is_cleaned_without_touching_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            target = root / "existing.txt"
+            target.write_text("old", encoding="utf-8")
+            tx_dir = Path(tmp) / "transactions" / "tx-intent"
+            tx_dir.mkdir(parents=True)
+            backup = tx_dir / "backup-00000000.txt.bak"
+            backup.write_text("old", encoding="utf-8")
+            manifest = {
+                "id": "tx-intent",
+                "status": "committing",
+                "files": [{
+                    "target": str(target),
+                    "backup": str(backup),
+                    "staged": None,
+                    "old_hash": importer_module._hash_file(target),
+                    "new_hash": "does-not-match-current",
+                    "commit_started": True,
+                    "committed": False,
+                    "undone": False,
+                }],
+            }
+            (tx_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+            with mock.patch.object(importer_module, "TRANSACTION_DIR", Path(tmp) / "transactions"):
+                removed = cleanup_orphaned_transactions(set())
+
+            self.assertEqual(removed, 1)
+            self.assertEqual(target.read_text(encoding="utf-8"), "old")
+            self.assertFalse(tx_dir.exists())
+
+    def test_interrupted_commit_is_preserved_when_target_changed_after_crash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            target = root / "existing.txt"
+            target.write_text("user-change", encoding="utf-8")
+            tx_dir = Path(tmp) / "transactions" / "tx-changed"
+            tx_dir.mkdir(parents=True)
+            backup = tx_dir / "backup-00000000.txt.bak"
+            backup.write_text("old", encoding="utf-8")
+            manifest = {
+                "id": "tx-changed",
+                "status": "committing",
+                "files": [{
+                    "target": str(target),
+                    "backup": str(backup),
+                    "staged": None,
+                    "old_hash": importer_module._hash_file(backup),
+                    "new_hash": "the-crashed-import",
+                    "commit_started": True,
+                    "committed": True,
+                    "undone": False,
+                }],
+            }
+            (tx_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+            with mock.patch.object(importer_module, "TRANSACTION_DIR", Path(tmp) / "transactions"):
+                removed = cleanup_orphaned_transactions(set())
+
+            self.assertEqual(removed, 0)
+            self.assertEqual(target.read_text(encoding="utf-8"), "user-change")
+            self.assertTrue(tx_dir.exists())
+            saved = json.loads(
+                (tx_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(saved["status"], "needs_manual_recovery")
+
+    def test_interrupted_undo_survives_startup_cleanup_and_can_resume(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            replaced = root / "replaced.txt"
+            new_file = root / "new.txt"
+            replaced.write_text("new", encoding="utf-8")
+            # The new file was already restored/deleted before the simulated crash.
+
+            tx_dir = Path(tmp) / "transactions" / "tx-undoing"
+            tx_dir.mkdir(parents=True)
+            backup = tx_dir / "backup.txt.bak"
+            backup.write_text("old", encoding="utf-8")
+            history_entry = import_history_module.HistoryEntry(**{
+                "id": "history-undoing",
+                "created_at": "2026-09-19T12:00:00+02:00",
+                "project_key": str(root.resolve()).casefold(),
+                "project_path": str(root.resolve()),
+                "source_zip_path": str(Path(tmp) / "source.zip"),
+                "source_zip_name": "source.zip",
+                "file_count": 2,
+                "new_count": 1,
+                "replaced_count": 1,
+                "unchanged_count": 0,
+                "paths": ("replaced.txt", "new.txt"),
+                "transaction_id": "tx-undoing",
+                "state": import_history_module.STATE_APPLIED,
+                "undo_state": import_history_module.UNDO_AVAILABLE,
+            })
+            manifest = {
+                "id": "tx-undoing",
+                "history": history_entry.to_dict(),
+                "status": "undoing",
+                "files": [
+                    {
+                        "target": str(replaced),
+                        "backup": str(backup),
+                        "staged": None,
+                        "old_hash": importer_module._hash_file(backup),
+                        "new_hash": importer_module._hash_file(replaced),
+                        "commit_started": True,
+                        "committed": True,
+                        "undone": False,
+                    },
+                    {
+                        "target": str(new_file),
+                        "backup": None,
+                        "staged": None,
+                        "old_hash": None,
+                        "new_hash": "hash-of-imported-new-file",
+                        "commit_started": True,
+                        "committed": True,
+                        "undone": True,
+                    },
+                ],
+            }
+            (tx_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+            history_file = Path(tmp) / "history.json"
+            app_dir = Path(tmp) / "app"
+            tx_root = Path(tmp) / "transactions"
+            with mock.patch.object(importer_module, "TRANSACTION_DIR", tx_root), \
+                    mock.patch.object(import_history_module, "TRANSACTION_DIR", tx_root), \
+                    mock.patch.object(import_history_module, "APP_DIR", app_dir), \
+                    mock.patch.object(import_history_module, "HISTORY_FILE", history_file):
+                import_history_module.save_history([history_entry])
+                active = import_history_module.reconcile_import_history()
+                self.assertIn("tx-undoing", active)
+                self.assertEqual(cleanup_orphaned_transactions(active), 0)
+                self.assertTrue(tx_dir.exists())
+
+                restored = undo_import("tx-undoing")
+                self.assertEqual(restored, 1)
+                self.assertEqual(replaced.read_text(encoding="utf-8"), "old")
+                self.assertFalse(new_file.exists())
+
+    def test_manual_recovery_transaction_is_not_deleted_on_later_cleanup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            target = root / "changed.txt"
+            target.write_text("user-change", encoding="utf-8")
+            tx_dir = Path(tmp) / "transactions" / "tx-manual"
+            tx_dir.mkdir(parents=True)
+            manifest = {
+                "id": "tx-manual",
+                "status": "needs_manual_recovery",
+                "files": [],
+            }
+            (tx_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+            with mock.patch.object(importer_module, "TRANSACTION_DIR", Path(tmp) / "transactions"):
+                self.assertEqual(cleanup_orphaned_transactions(set()), 0)
+                self.assertTrue(tx_dir.exists())
+                self.assertEqual(cleanup_orphaned_transactions(set()), 0)
+                self.assertTrue(tx_dir.exists())
 
     def test_recent_projects_move_to_front_and_dedupe(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -555,3 +837,192 @@ class ImporterTests(unittest.TestCase):
             cleanup_orphaned_transactions(set())
             self.assertFalse(tx_dir.exists())
             self.assertFalse(backup_files[0].exists())
+
+
+class ImportHistoryLifecycleTests(unittest.TestCase):
+    def _history_paths(self, tmp: str):
+        root = Path(tmp)
+        tx_dir = root / "transactions"
+        history_file = root / "history.json"
+        app_dir = root / "app"
+        return tx_dir, history_file, app_dir
+
+    def test_apply_import_records_history_inside_core_transaction_boundary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            target = root / "existing.txt"
+            target.write_text("old", encoding="utf-8")
+            zip_path = Path(tmp) / "update.zip"
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr("existing.txt", "new")
+
+            entries, candidates = analyze(zip_path, root)
+            plan = enrich_plan_hashes(zip_path, make_plan(
+                entries, candidates[0].prefix, root))
+            tx_dir, history_file, app_dir = self._history_paths(tmp)
+            with mock.patch.object(importer_module, "TRANSACTION_DIR", tx_dir), \
+                    mock.patch.object(import_history_module, "TRANSACTION_DIR", tx_dir), \
+                    mock.patch.object(import_history_module, "APP_DIR", app_dir), \
+                    mock.patch.object(import_history_module, "HISTORY_FILE", history_file):
+                applied, transaction_id = apply_import(
+                    zip_path, plan, project_root=root)
+                self.assertEqual(applied, 1)
+                self.assertIsNotNone(transaction_id)
+                history = import_history_module.load_history()
+                self.assertEqual(len(history), 1)
+                self.assertEqual(history[0].transaction_id, transaction_id)
+                self.assertTrue(history[0].can_undo)
+
+    def test_noop_import_recovery_manifest_reconstructs_history_after_write_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            target = root / "same.txt"
+            target.write_text("same", encoding="utf-8")
+            zip_path = Path(tmp) / "update.zip"
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr("same.txt", "same")
+
+            entries, candidates = analyze(zip_path, root)
+            plan = enrich_plan_hashes(zip_path, make_plan(
+                entries, candidates[0].prefix, root))
+            tx_dir, history_file, app_dir = self._history_paths(tmp)
+            with mock.patch.object(importer_module, "TRANSACTION_DIR", tx_dir), \
+                    mock.patch.object(import_history_module, "TRANSACTION_DIR", tx_dir), \
+                    mock.patch.object(import_history_module, "APP_DIR", app_dir), \
+                    mock.patch.object(import_history_module, "HISTORY_FILE", history_file), \
+                    mock.patch.object(importer_module, "record_applied_import", side_effect=OSError("history unavailable")):
+                applied, transaction_id = apply_import(
+                    zip_path, plan, project_root=root)
+                self.assertEqual(applied, 0)
+                self.assertIsNone(transaction_id)
+                self.assertEqual(history_file.exists(), False)
+                manifests = list(tx_dir.glob("*/manifest.json"))
+                self.assertEqual(len(manifests), 1)
+
+                recovered = import_history_module.reconcile_import_history()
+                self.assertEqual(recovered, set())
+                history = import_history_module.load_history()
+                self.assertEqual(len(history), 1)
+                self.assertTrue(history[0].is_noop)
+                self.assertFalse(history[0].can_undo)
+
+                cleanup_orphaned_transactions(recovered)
+                self.assertFalse(manifests[0].parent.exists())
+
+    def test_noop_import_is_retained_as_history_without_undo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            target = root / "same.txt"
+            target.write_text("same", encoding="utf-8")
+            zip_path = Path(tmp) / "update.zip"
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr("same.txt", "same")
+
+            entries, candidates = analyze(zip_path, root)
+            plan = enrich_plan_hashes(zip_path, make_plan(
+                entries, candidates[0].prefix, root))
+            tx_dir, history_file, app_dir = self._history_paths(tmp)
+            with mock.patch.object(importer_module, "TRANSACTION_DIR", tx_dir), \
+                    mock.patch.object(import_history_module, "TRANSACTION_DIR", tx_dir), \
+                    mock.patch.object(import_history_module, "APP_DIR", app_dir), \
+                    mock.patch.object(import_history_module, "HISTORY_FILE", history_file):
+                applied, transaction_id = apply_import(
+                    zip_path, plan, project_root=root)
+                self.assertEqual(applied, 0)
+                self.assertIsNone(transaction_id)
+                history = import_history_module.load_history()
+                self.assertEqual(len(history), 1)
+                self.assertEqual(history[0].file_count, 1)
+                self.assertEqual(history[0].unchanged_count, 1)
+                self.assertFalse(history[0].can_undo)
+                self.assertEqual(history[0].undo_state,
+                                 import_history_module.UNDO_UNAVAILABLE)
+                self.assertEqual(list(tx_dir.glob("*/manifest.json")), [])
+
+    def test_undo_updates_history_from_core_transaction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            target = root / "existing.txt"
+            target.write_text("old", encoding="utf-8")
+            zip_path = Path(tmp) / "update.zip"
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr("existing.txt", "new")
+            entries, candidates = analyze(zip_path, root)
+            plan = enrich_plan_hashes(zip_path, make_plan(
+                entries, candidates[0].prefix, root))
+            tx_dir, history_file, app_dir = self._history_paths(tmp)
+            with mock.patch.object(importer_module, "TRANSACTION_DIR", tx_dir), \
+                    mock.patch.object(import_history_module, "TRANSACTION_DIR", tx_dir), \
+                    mock.patch.object(import_history_module, "APP_DIR", app_dir), \
+                    mock.patch.object(import_history_module, "HISTORY_FILE", history_file):
+                _, transaction_id = apply_import(
+                    zip_path, plan, project_root=root)
+                assert transaction_id is not None
+                restored = undo_import(transaction_id)
+                self.assertEqual(restored, 1)
+                entry = import_history_module.load_history()[0]
+                self.assertEqual(
+                    entry.state, import_history_module.STATE_UNDONE)
+                self.assertFalse(entry.can_undo)
+
+    def test_history_write_failure_after_commit_is_recovered_from_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            target = root / "existing.txt"
+            target.write_text("old", encoding="utf-8")
+            zip_path = Path(tmp) / "update.zip"
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr("existing.txt", "new")
+            entries, candidates = analyze(zip_path, root)
+            plan = enrich_plan_hashes(zip_path, make_plan(
+                entries, candidates[0].prefix, root))
+            tx_dir, history_file, app_dir = self._history_paths(tmp)
+            with mock.patch.object(importer_module, "TRANSACTION_DIR", tx_dir), \
+                    mock.patch.object(import_history_module, "TRANSACTION_DIR", tx_dir), \
+                    mock.patch.object(import_history_module, "APP_DIR", app_dir), \
+                    mock.patch.object(import_history_module, "HISTORY_FILE", history_file), \
+                    mock.patch.object(importer_module, "record_applied_import", side_effect=OSError("history unavailable")):
+                applied, transaction_id = apply_import(
+                    zip_path, plan, project_root=root)
+                self.assertEqual(applied, 1)
+                self.assertIsNotNone(transaction_id)
+                self.assertFalse(history_file.exists())
+                active = import_history_module.reconcile_import_history()
+                self.assertEqual(active, {transaction_id})
+                history = import_history_module.load_history()
+                self.assertEqual(len(history), 1)
+                self.assertTrue(history[0].can_undo)
+
+    def test_failed_undo_is_recorded_as_failed_without_changing_applied_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            target = root / "existing.txt"
+            target.write_text("old", encoding="utf-8")
+            zip_path = Path(tmp) / "update.zip"
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr("existing.txt", "new")
+            entries, candidates = analyze(zip_path, root)
+            plan = enrich_plan_hashes(zip_path, make_plan(
+                entries, candidates[0].prefix, root))
+            tx_dir, history_file, app_dir = self._history_paths(tmp)
+            with mock.patch.object(importer_module, "TRANSACTION_DIR", tx_dir), \
+                    mock.patch.object(import_history_module, "TRANSACTION_DIR", tx_dir), \
+                    mock.patch.object(import_history_module, "APP_DIR", app_dir), \
+                    mock.patch.object(import_history_module, "HISTORY_FILE", history_file):
+                _, transaction_id = apply_import(
+                    zip_path, plan, project_root=root)
+                assert transaction_id is not None
+                target.write_text("changed after import", encoding="utf-8")
+                with self.assertRaises(RuntimeError):
+                    undo_import(transaction_id)
+                history = import_history_module.load_history()[0]
+                self.assertEqual(
+                    history.state, import_history_module.STATE_APPLIED)
+                self.assertEqual(history.undo_state,
+                                 import_history_module.UNDO_AVAILABLE)

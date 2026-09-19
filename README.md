@@ -26,7 +26,7 @@ You can see which files are new, changed, or unchanged, inspect individual chang
 
 The app checks the ZIP before import and can warn you when it appears to belong to a different project. Invalid or incomplete ZIPs are not imported.
 
-After an import, the operation appears under **Recent imports**. Imports that still have undo information can be reversed with **Undo selected import**.
+After an import, the operation appears under **Recent imports**. Imports that still have undo information can be reversed with **Undo selected import** or from the entry's context menu.
 
 ## Watching downloads automatically
 
