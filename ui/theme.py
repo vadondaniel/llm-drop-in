@@ -260,7 +260,7 @@ def _apply_class(widget: QWidget, class_name: str, tokens: ThemeTokens) -> None:
         widget.setStyleSheet("QCheckBox { spacing: 8px; }")
     elif class_name == "primary-button":
         widget.setStyleSheet(f"""
-            QPushButton {{
+            QPushButton, QToolButton {{
                 background: {_css(tokens.accent)};
                 color: {_css(tokens.accent_text)};
                 border: none;
@@ -268,9 +268,30 @@ def _apply_class(widget: QWidget, class_name: str, tokens: ThemeTokens) -> None:
                 padding: 8px 14px;
                 font-weight: 700;
             }}
-            QPushButton:hover {{ background: {_css(tokens.accent_hover)}; }}
-            QPushButton:pressed {{ background: {_css(tokens.accent_pressed)}; }}
-            QPushButton:disabled {{
+            QPushButton:hover, QToolButton:hover {{
+                background: {_css(tokens.accent_hover)};
+            }}
+            QWidget#PackageButton {{
+                border-radius: 8px;
+            }}
+            QPushButton#PackageMainButton {{
+                border-top-right-radius: 0px;
+                border-bottom-right-radius: 0px;
+                padding: 8px 12px 8px 14px;
+            }}
+            QPushButton#PackageMenuButton {{
+                border-top-left-radius: 0px;
+                border-bottom-left-radius: 0px;
+                padding: 0px;
+                min-width: 28px;
+                max-width: 28px;
+                font-size: 14px;
+                font-weight: 700;
+            }}
+            QPushButton:pressed, QToolButton:pressed {{
+                background: {_css(tokens.accent_pressed)};
+            }}
+            QPushButton:disabled, QToolButton:disabled {{
                 background: {_css(tokens.surface_alt)};
                 color: {_css(tokens.disabled_text)};
             }}

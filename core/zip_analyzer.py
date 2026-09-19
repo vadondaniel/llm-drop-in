@@ -7,6 +7,8 @@ import os
 import subprocess
 import zipfile
 
+_WINDOWS_NO_CONSOLE = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 
 DEFAULT_MAX_FILES = 20_000
 DEFAULT_MAX_UNCOMPRESSED_BYTES = 2 * 1024 * 1024 * 1024
@@ -172,6 +174,7 @@ def _git_ignored_paths(project_root: Path, paths: list[str]) -> set[str]:
             errors="replace",
             capture_output=True,
             check=False,
+            creationflags=_WINDOWS_NO_CONSOLE,
         )
     except (FileNotFoundError, OSError):
         return set()

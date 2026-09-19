@@ -3,17 +3,24 @@ from __future__ import annotations
 from html import escape
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QThread, Qt, Signal
-from PySide6.QtGui import QDragEnterEvent, QDropEvent
+from PySide6.QtCore import QObject, QThread, Qt, Signal, QMimeData, QUrl, QPoint
+from PySide6.QtGui import QAction, QDrag, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
     QMessageBox, QPushButton, QVBoxLayout, QWidget, QListWidget, QListWidgetItem,
-    QDialog, QProgressBar, QAbstractItemView, QComboBox,
+    QDialog, QProgressBar, QAbstractItemView, QComboBox, QMenu,
 )
 
 from core.importer import apply_import, cleanup_orphaned_transactions, history_entry, make_plan, undo_import
 from core.settings import add_history, load_history, load_settings, save_settings, update_history_entry, remember_project
 from core.zip_analyzer import ImportAnalysis, analyze_for_import
+from core.packer import (
+    PACKAGE_HEAD,
+    PACKAGE_STAGED,
+    PACKAGE_WORKTREE,
+    PackageResult,
+    package_project,
+)
 from ui.import_preview import ImportPreviewDialog
 from ui.theme import apply_theme, set_style_class
 
@@ -54,6 +61,26 @@ class ImportWorker(QObject):
             applied, transaction_id = apply_import(
                 self.path, self.plan, project_root=self.project)
             self.succeeded.emit(applied, transaction_id)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        finally:
+            self.finished.emit()
+
+
+class PackageWorker(QObject):
+    succeeded = Signal(object)
+    failed = Signal(str)
+    finished = Signal()
+
+    def __init__(self, project: Path, scope: str):
+        super().__init__()
+        self.project = project
+        self.scope = scope
+
+    def run(self):
+        try:
+            result = package_project(self.project, scope=self.scope)
+            self.succeeded.emit(result)
         except Exception as exc:
             self.failed.emit(str(exc))
         finally:
@@ -102,6 +129,76 @@ class DropArea(QFrame):
         event.ignore()
 
 
+class DraggableArchive(QFrame):
+    """A small file surface that can be dragged into another application."""
+
+    def __init__(self, result: PackageResult, parent=None):
+        super().__init__(parent)
+        self.result = result
+        self._press_pos = None
+        self.setObjectName("DraggableArchive")
+        set_style_class(self, "surface-alt")
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.setToolTip(
+            "Drag this ZIP into the browser chat to upload it. "
+            "The file is stored next to the project."
+        )
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 9, 12, 9)
+        layout.setSpacing(2)
+
+        self.name_label = QLabel(result.path.name)
+        self.name_label.setObjectName("ArchiveName")
+        self.name_label.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        layout.addWidget(self.name_label)
+
+        scope_names = {
+            PACKAGE_WORKTREE: "Working tree · tracked + non-ignored untracked files",
+            PACKAGE_STAGED: "Staged state · current Git index",
+            PACKAGE_HEAD: "HEAD · last committed state",
+        }
+        metadata = (
+            f"{scope_names.get(result.scope, result.scope)} · "
+            f"{result.files:,} files · {result.size_bytes / (1024 * 1024):.2f} MB"
+        )
+        if result.missing:
+            metadata += f" · {len(result.missing):,} missing"
+        self.metadata_label = QLabel(metadata)
+        self.metadata_label.setObjectName("ArchiveMetadata")
+        self.metadata_label.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        set_style_class(self.metadata_label, "subtle")
+        layout.addWidget(self.metadata_label)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._press_pos = event.position().toPoint()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._press_pos is None or not (
+            event.buttons() & Qt.MouseButton.LeftButton
+        ):
+            return
+        distance = (event.position().toPoint() -
+                    self._press_pos).manhattanLength()
+        if distance < QApplication.startDragDistance():
+            return
+
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(str(self.result.path))])
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        try:
+            drag.exec(Qt.DropAction.CopyAction)
+        finally:
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+            self._press_pos = None
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -121,6 +218,8 @@ class MainWindow(QMainWindow):
         self.worker: QObject | None = None
         self._pending_zip: Path | None = None
         self._pending_plan = None
+        self._worker_kind: str | None = None
+        self._package_artifact: DraggableArchive | None = None
         self._cleanup_stale_transactions()
         self._build()
         app = QApplication.instance()
@@ -176,6 +275,7 @@ class MainWindow(QMainWindow):
             self._refresh_recent_projects()
             return
         self.project = path.resolve()
+        self._clear_package_artifact()
         remember_project(self.settings, self.project)
         save_settings(self.settings)
         self._refresh()
@@ -196,6 +296,59 @@ class MainWindow(QMainWindow):
         set_style_class(title, "title")
         title_block.addWidget(title)
         header.addLayout(title_block, 1)
+
+        # The built-in QToolButton menu subcontrol gets awkward quickly: its
+        # arrow sizing is style-dependent, while the clickable menu-button
+        # region is separate from the main text layout. Use a real split
+        # button instead so the hit target, padding, and arrow glyph are all
+        # explicit and stable.
+        self.package_button = QWidget()
+        self.package_button.setObjectName("PackageButton")
+        set_style_class(self.package_button, "primary-button")
+        package_button_layout = QHBoxLayout(self.package_button)
+        package_button_layout.setContentsMargins(0, 0, 0, 0)
+        package_button_layout.setSpacing(0)
+
+        self.package_main_button = QPushButton("Create ZIP")
+        self.package_main_button.setObjectName("PackageMainButton")
+        set_style_class(self.package_main_button, "primary-button")
+        self.package_main_button.setMinimumHeight(40)
+        self.package_main_button.setToolTip(
+            "Create a ZIP from the current working tree."
+        )
+        self.package_main_button.clicked.connect(
+            lambda _checked=False: self._create_package(PACKAGE_WORKTREE)
+        )
+        package_button_layout.addWidget(self.package_main_button)
+
+        self.package_menu_button = QPushButton("▼")
+        self.package_menu_button.setObjectName("PackageMenuButton")
+        set_style_class(self.package_menu_button, "primary-button")
+        self.package_menu_button.setFixedSize(28, 40)
+        self.package_menu_button.setToolTip(
+            "Choose whether to package the working tree, staged state, or HEAD."
+        )
+        package_menu = QMenu(self.package_menu_button)
+        for scope, text in (
+            (PACKAGE_WORKTREE, "Create from working tree"),
+            (PACKAGE_STAGED, "Create from staged state"),
+            (PACKAGE_HEAD, "Create from HEAD"),
+        ):
+            action = QAction(text, self)
+            action.setData(scope)
+            action.triggered.connect(
+                lambda _checked=False, scope=scope: self._create_package(scope)
+            )
+            package_menu.addAction(action)
+        self.package_menu_button.clicked.connect(
+            lambda _checked=False: package_menu.popup(
+                self.package_menu_button.mapToGlobal(
+                    QPoint(0, self.package_menu_button.height())
+                )
+            )
+        )
+        package_button_layout.addWidget(self.package_menu_button)
+        header.addWidget(self.package_button)
         layout.addLayout(header)
 
         body = QWidget()
@@ -256,6 +409,15 @@ class MainWindow(QMainWindow):
         self.drop.setMinimumHeight(220)
         import_layout.addWidget(self.drop)
         main_column.addWidget(import_card, 1)
+
+        self.package_artifact_host = QWidget()
+        self.package_artifact_layout: QVBoxLayout = QVBoxLayout(
+            self.package_artifact_host
+        )
+        self.package_artifact_layout.setContentsMargins(0, 0, 0, 0)
+        self.package_artifact_layout.setSpacing(0)
+        self.package_artifact_host.hide()
+        main_column.addWidget(self.package_artifact_host)
 
         status_bar = QFrame()
         status_bar.setObjectName("AppStatusBar")
@@ -436,6 +598,83 @@ class MainWindow(QMainWindow):
             "undone") and bool(entry.get("transaction_id"))
         self.undo.setEnabled(can_undo and self.worker_thread is None)
 
+    def _clear_package_artifact(self):
+        if self._package_artifact is not None:
+            layout = self.package_artifact_host.layout()
+            if layout is not None:
+                layout.removeWidget(self._package_artifact)
+            self._package_artifact.setParent(None)
+            self._package_artifact.deleteLater()
+            self._package_artifact = None
+        if hasattr(self, "package_artifact_host"):
+            self.package_artifact_host.hide()
+
+    @staticmethod
+    def _format_package_status(result: PackageResult) -> str:
+        size = result.size_bytes
+        if size >= 1024 * 1024:
+            size_text = f"{size / (1024 * 1024):.2f} MB"
+        elif size >= 1024:
+            size_text = f"{size / 1024:.1f} KB"
+        else:
+            size_text = f"{size} B"
+        return f"Created {result.path.name} · {result.files:,} files · {size_text}"
+
+    def _create_package(self, scope: str):
+        if self.worker_thread is not None:
+            return
+        project = self.project
+        if project is None or not project.exists() or not project.is_dir():
+            QMessageBox.warning(
+                self,
+                "No project",
+                "Select a project folder first.",
+            )
+            return
+
+        self._clear_package_artifact()
+        self._worker_kind = "package"
+        self.package_button.setEnabled(False)
+        self.drop.setEnabled(False)
+        self.progress.show()
+
+        scope_text = {
+            PACKAGE_WORKTREE: "working tree",
+            PACKAGE_STAGED: "staged state",
+            PACKAGE_HEAD: "HEAD",
+        }.get(scope, scope)
+        self._set_status(f"Creating ZIP from {scope_text}…", active=True)
+
+        self.worker_thread = QThread(self)
+        self.worker = PackageWorker(project, scope)
+        self.worker.moveToThread(self.worker_thread)
+        self.worker.succeeded.connect(self._package_succeeded)
+        self.worker.failed.connect(self._package_failed)
+        self.worker_thread.started.connect(self.worker.run)
+        self.worker.finished.connect(self.worker_thread.quit)
+        self.worker_thread.finished.connect(self._worker_finished)
+        self.worker_thread.start()
+
+    def _package_succeeded(self, result: PackageResult):
+        self._clear_package_artifact()
+        self._package_artifact = DraggableArchive(
+            result, self.package_artifact_host)
+        self.package_artifact_layout.addWidget(self._package_artifact)
+        self.package_artifact_host.show()
+
+        if result.missing:
+            self._set_status(
+                self._format_package_status(result)
+                + f" · {len(result.missing):,} missing on disk",
+                error=True,
+            )
+        else:
+            self._set_status(self._format_package_status(result))
+
+    def _package_failed(self, message: str):
+        QMessageBox.critical(self, "Could not create ZIP", message)
+        self._set_status("ZIP creation failed", error=True)
+
     def choose_project(self):
         path = QFileDialog.getExistingDirectory(
             self,
@@ -445,6 +684,7 @@ class MainWindow(QMainWindow):
         if not path:
             return
         self.project = Path(path).resolve()
+        self._clear_package_artifact()
         remember_project(self.settings, self.project)
         save_settings(self.settings)
         self._refresh_recent_projects()
@@ -469,6 +709,7 @@ class MainWindow(QMainWindow):
                                 "Please select a ZIP archive.")
             return
         self._pending_zip = path
+        self._worker_kind = "analyze"
         self.drop.setEnabled(False)
         self.progress.show()
         self._set_status(f"Analyzing {path.name}…", active=True)
@@ -491,6 +732,8 @@ class MainWindow(QMainWindow):
         self.worker_thread = None
         self.progress.hide()
         self.drop.setEnabled(True)
+        self.package_button.setEnabled(True)
+        self._worker_kind = None
         self._history_selection_changed()
 
     def _analysis_failed(self, message: str):
@@ -564,6 +807,7 @@ class MainWindow(QMainWindow):
         selected = dialog.selected
         self._pending_zip = path
         self._pending_plan = selected
+        self._worker_kind = "import"
         self.drop.setEnabled(False)
         self.progress.show()
         self._set_status(f"Applying {len(selected)} files…", active=True)

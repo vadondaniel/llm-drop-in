@@ -19,6 +19,8 @@ A small PySide6 Windows utility for dropping LLM-generated ZIPs onto a selected 
 - Keep a local import history.
 - Run archive analysis in a worker thread so the UI stays responsive.
 - Exclude files matched by Git ignore rules by default, with an option to include them.
+- Create a project ZIP directly from the selected folder and drag the result into a browser chat.
+- Package the current working tree, the staged Git index, or the last committed HEAD snapshot.
 
 ## Requirements
 
