@@ -1,0 +1,2 @@
+# Build-time dependency; runtime dependencies stay in requirements.txt.
+PyInstaller>=6.17,<7

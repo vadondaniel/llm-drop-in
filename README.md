@@ -54,6 +54,12 @@ py -m unittest discover -s core -p "test_*.py"
 With PyInstaller:
 
 ```powershell
-py -m pip install pyinstaller
-pyinstaller --noconsole --onedir --name LLM-Drop-In main.py
+py -m pip install -r requirements-build.txt
+pyinstaller --noconfirm --clean LLM-Drop-In.spec
 ```
+
+`LLM-Drop-In.spec` is the **single authoritative build configuration**. The spec uses PyInstaller's `SPECPATH` value to locate project files, so it works when the spec is executed normally by PyInstaller. There is deliberately no second build script to keep in sync with it. The resulting application is `dist\LLM-Drop-In\LLM-Drop-In.exe`.
+
+The distribution uses **onedir** rather than onefile: startup is faster, the packaged files are inspectable when diagnosing a user report, and the application does not need to unpack itself into a temporary directory on every launch. UPX compression is intentionally disabled for a more predictable Qt/Windows build.
+
+The spec also embeds `app.ico` into the executable and bundles a runtime copy beside it. The application sets a stable Windows AppUserModelID before creating `QApplication`, so Windows can associate the process with the LLM Drop-In icon on the taskbar.
