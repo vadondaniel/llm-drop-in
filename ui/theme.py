@@ -193,6 +193,48 @@ def _apply_class(widget: QWidget, class_name: str, tokens: ThemeTokens) -> None:
     elif class_name == "surface-sidebar":
         widget.setAutoFillBackground(True)
         widget.setStyleSheet(_surface_style(tokens, radius=12, sidebar=True))
+    elif class_name == "archive-surface":
+        widget.setAutoFillBackground(True)
+        widget.setStyleSheet(f"""
+            *[styleClass="archive-surface"] {{
+                background: {_css(tokens.surface_alt)};
+                border: 1px solid {_css(tokens.border)};
+                border-radius: 11px;
+            }}
+            *[styleClass="archive-surface"]:hover {{
+                background: {_css(tokens.accent_soft)};
+                border-color: {_css(tokens.accent)};
+            }}
+        """)
+    elif class_name == "archive-file-badge":
+        widget.setAutoFillBackground(True)
+        widget.setStyleSheet(f"""
+            *[styleClass="archive-file-badge"] {{
+                background: {_css(tokens.accent_soft)};
+                border: 1px solid {_css(tokens.accent)};
+                border-radius: 8px;
+            }}
+        """)
+    elif class_name == "archive-file-badge-text":
+        _set_text_color(widget, tokens.accent)
+        _set_font(widget, point_size=9, bold=True)
+    elif class_name == "archive-name":
+        _set_text_color(widget, tokens.text)
+        _set_font(widget, bold=True)
+    elif class_name == "archive-metadata-strong":
+        _set_text_color(widget, tokens.text_muted)
+        _set_font(widget, bold=True)
+    elif class_name == "archive-drag-hint":
+        widget.setAutoFillBackground(False)
+        widget.setStyleSheet(f"""
+            *[styleClass="archive-drag-hint"] {{
+                background: transparent;
+                color: {_css(tokens.text_muted)};
+                border: none;
+                padding: 0;
+            }}
+        """)
+        _set_font(widget, point_size=9, bold=False)
     elif class_name == "surface-alt":
         widget.setAutoFillBackground(True)
         widget.setStyleSheet(

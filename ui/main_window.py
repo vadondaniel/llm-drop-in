@@ -155,7 +155,7 @@ class DraggableArchiveLabel(QLabel):
 
 
 class DraggableArchive(QFrame):
-    """A small file surface that can be dragged into another application."""
+    """A visible file surface that can be dragged into another application."""
 
     def __init__(self, result: PackageResult, parent=None):
         super().__init__(parent)
@@ -165,30 +165,47 @@ class DraggableArchive(QFrame):
             result.path.stat().st_mtime, tz=timezone.utc
         )
         self.setObjectName("DraggableArchive")
-        set_style_class(self, "surface-alt")
+        set_style_class(self, "archive-surface")
         self.setCursor(Qt.CursorShape.OpenHandCursor)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 9, 12, 9)
-        layout.setSpacing(2)
+        self.setMouseTracking(True)
 
-        name_row = QHBoxLayout()
-        name_row.setContentsMargins(0, 0, 0, 0)
-        name_row.setSpacing(6)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(11)
+
+        self.file_badge = QFrame()
+        self.file_badge.setObjectName("ArchiveFileBadge")
+        set_style_class(self.file_badge, "archive-file-badge")
+        self.file_badge.setFixedSize(42, 42)
+        badge_layout = QVBoxLayout(self.file_badge)
+        badge_layout.setContentsMargins(0, 0, 0, 0)
+        badge_layout.setSpacing(0)
+        badge_text = QLabel("ZIP")
+        badge_text.setObjectName("ArchiveFileBadgeText")
+        set_style_class(badge_text, "archive-file-badge-text")
+        badge_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        badge_text.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        badge_layout.addWidget(badge_text)
+        layout.addWidget(self.file_badge)
+
+        content = QVBoxLayout()
+        content.setContentsMargins(0, 0, 0, 0)
+        content.setSpacing(2)
+
+        top_row = QHBoxLayout()
+        top_row.setContentsMargins(0, 0, 0, 0)
+        top_row.setSpacing(7)
 
         self.name_label = DraggableArchiveLabel(self, result.path.name)
         self.name_label.setObjectName("ArchiveName")
-        name_row.addWidget(self.name_label)
-
-        self.time_label = DraggableArchiveLabel(self)
-        self.time_label.setObjectName("ArchiveTime")
-        set_style_class(self.time_label, "subtle")
-        name_row.addWidget(self.time_label)
-        name_row.addStretch(1)
-        layout.addLayout(name_row)
+        set_style_class(self.name_label, "archive-name")
+        top_row.addWidget(self.name_label, 1)
+        content.addLayout(top_row)
 
         metadata_layout = QHBoxLayout()
         metadata_layout.setContentsMargins(0, 0, 0, 0)
-        metadata_layout.setSpacing(6)
+        metadata_layout.setSpacing(5)
 
         scope_names = {
             PACKAGE_WORKTREE: "Working tree",
@@ -200,7 +217,7 @@ class DraggableArchive(QFrame):
         )
         self.scope_label.setObjectName("ArchiveMetadata")
         self.scope_label.setToolTip(self._scope_tooltip(result.scope))
-        set_style_class(self.scope_label, "subtle")
+        set_style_class(self.scope_label, "archive-metadata-strong")
         metadata_layout.addWidget(self.scope_label)
 
         self.detail_label = QLabel(
@@ -210,17 +227,48 @@ class DraggableArchive(QFrame):
         self.detail_label.setAttribute(
             Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         set_style_class(self.detail_label, "subtle")
-        metadata_layout.addWidget(self.detail_label, 1)
+        metadata_layout.addWidget(self.detail_label)
 
         if result.missing:
-            missing_label = QLabel(f"{len(result.missing):,} missing")
+            missing_label = QLabel(f"· {len(result.missing):,} missing")
             missing_label.setObjectName("ArchiveMetadata")
             missing_label.setAttribute(
                 Qt.WidgetAttribute.WA_TransparentForMouseEvents)
             set_style_class(missing_label, "subtle")
             metadata_layout.addWidget(missing_label)
 
-        layout.addLayout(metadata_layout)
+        metadata_layout.addStretch(1)
+        content.addLayout(metadata_layout)
+        layout.addLayout(content, 1)
+
+        right_column = QVBoxLayout()
+        right_column.setContentsMargins(0, 0, 0, 0)
+        right_column.setSpacing(4)
+        right_column.setAlignment(Qt.AlignmentFlag.AlignRight)
+
+        # Keep the time and drag affordance in one explicit right-hand rail so
+        # both share the same visual right edge instead of the time floating
+        # between the filename and the drag hint.
+        self.time_label = DraggableArchiveLabel(self)
+        self.time_label.setObjectName("ArchiveTime")
+        set_style_class(self.time_label, "subtle")
+        self.time_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        right_column.addWidget(
+            self.time_label, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+
+        self.drag_hint = DraggableArchiveLabel(self, "↗  Drag into chat")
+        self.drag_hint.setObjectName("ArchiveDragHint")
+        set_style_class(self.drag_hint, "archive-drag-hint")
+        self.drag_hint.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        right_column.addWidget(self.drag_hint)
+
+        layout.addLayout(right_column)
+
         self._update_time_display()
         self._time_timer = QTimer(self)
         self._time_timer.setInterval(30_000)
@@ -230,9 +278,9 @@ class DraggableArchive(QFrame):
     @staticmethod
     def _scope_tooltip(scope: str) -> str:
         return {
-            PACKAGE_WORKTREE: "Working tree · tracked + non-ignored untracked files",
-            PACKAGE_STAGED: "Staged state · current Git index",
-            PACKAGE_HEAD: "HEAD · last committed state",
+            PACKAGE_WORKTREE: "tracked + non-ignored untracked files",
+            PACKAGE_STAGED: "current Git index",
+            PACKAGE_HEAD: "last committed state",
         }.get(scope, scope)
 
     @staticmethod
@@ -257,10 +305,8 @@ class DraggableArchive(QFrame):
     def _update_time_display(self) -> None:
         exact = self._created_at.astimezone().strftime("%d %b %Y, %H:%M:%S")
         relative = self._relative_time(self._created_at)
-        self.time_label.setText(f"{relative}")
-        self.time_label.setToolTip(
-            f"<b>Created</b><br>{escape(exact)}"
-        )
+        self.time_label.setText(relative)
+        self.time_label.setToolTip(f"<b>Created</b><br>{escape(exact)}")
 
     def _try_start_drag(self, buttons, global_pos: QPoint) -> None:
         if self._drag_press_global is None or not (
@@ -703,6 +749,9 @@ class MainWindow(QMainWindow):
         self._package_artifact = DraggableArchive(
             result, self.package_artifact_host)
         self.package_artifact_layout.addWidget(self._package_artifact)
+        # The archive surface is created after the main window's initial theme
+        # pass, so explicitly theme this new widget subtree.
+        apply_theme(self._package_artifact)
         self.package_artifact_host.show()
 
     def _history_selection_changed(self):
@@ -774,6 +823,9 @@ class MainWindow(QMainWindow):
         self._package_artifact = DraggableArchive(
             result, self.package_artifact_host)
         self.package_artifact_layout.addWidget(self._package_artifact)
+        # The archive surface is created after the main window's initial theme
+        # pass, so explicitly theme this new widget subtree.
+        apply_theme(self._package_artifact)
         self.package_artifact_host.show()
 
         if result.missing:
