@@ -10,11 +10,54 @@ from pathlib import Path
 
 from core.importer import apply_import, enrich_plan_hashes, make_plan, undo_import
 from core.settings import TRANSACTION_DIR, remember_project
-from core.zip_analyzer import analyze, analyze_for_import
+from core.zip_analyzer import (
+    ProjectMatchHandling, ProjectMatchLevel, analyze, analyze_for_import,
+    assess_project_match, is_plausibly_for_project, project_match_handling,
+)
 
 
 class ZipIgnoreTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("git"), "Git is required for ignore-rule tests")
+    def test_truncated_archive_name_still_matches_project(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "very-long-llm-drop-in-project-name"
+            root.mkdir()
+            zip_path = Path(tmp) / "very-long-llm-drop-in-proj.zip"
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr("src/feature.py", "changed")
+            analysis = analyze_for_import(zip_path, root)
+            self.assertTrue(analysis.archive_name_matches_project)
+
+    def test_short_name_fragment_does_not_match_project(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "long-llm-drop-in-project"
+            root.mkdir()
+            zip_path = Path(tmp) / "long-llm.zip"
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr("src/feature.py", "changed")
+            analysis = analyze_for_import(zip_path, root)
+            self.assertFalse(analysis.archive_name_matches_project)
+
+    def test_replaced_suffix_after_truncated_project_name_still_matches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "very-long-llm-drop-in-project-structure-name"
+            root.mkdir()
+            zip_path = Path(tmp) / "very-long-llm-drop-in-fixed-final(2).zip"
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr("src/feature.py", "changed")
+            analysis = analyze_for_import(zip_path, root)
+            self.assertTrue(analysis.archive_name_matches_project)
+
+    def test_unrelated_shared_two_token_prefix_does_not_match(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "very-long-llm-drop-in-project-structure-name"
+            root.mkdir()
+            zip_path = Path(tmp) / "very-long-llm-other-fix.zip"
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr("src/feature.py", "changed")
+            analysis = analyze_for_import(zip_path, root)
+            self.assertFalse(analysis.archive_name_matches_project)
+
     def test_gitignored_files_are_excluded_by_default(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "project"
@@ -78,6 +121,259 @@ class ZipIgnoreTests(unittest.TestCase):
             self.assertEqual(len(plan), 1)
             self.assertEqual(plan[0].action, "unchanged")
             self.assertIsNotNone(plan[0].new_hash)
+
+    def test_project_match_accepts_existing_project_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            (root / "src" / "feature").mkdir(parents=True)
+            (root / "src" / "feature" /
+             "planner.py").write_text("one", encoding="utf-8")
+            (root / "src" / "feature" / "reader.py").write_text("two", encoding="utf-8")
+            zip_path = Path(tmp) / "update.zip"
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr("src/feature/planner.py", "changed")
+                zf.writestr("src/feature/reader.py", "changed")
+                zf.writestr("src/feature/new.py", "new")
+
+            analysis = analyze_for_import(zip_path, root)
+
+            self.assertTrue(is_plausibly_for_project(analysis))
+
+    def test_project_match_accepts_one_unchanged_existing_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            (root / "src" / "feature").mkdir(parents=True)
+            (root / "src" / "feature" /
+             "marker.py").write_text("same", encoding="utf-8")
+            zip_path = Path(tmp) / "update.zip"
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr("src/feature/marker.py", "same")
+                zf.writestr("src/feature/new.py", "new")
+
+            analysis = analyze_for_import(zip_path, root)
+
+            self.assertTrue(is_plausibly_for_project(analysis))
+
+    def test_project_match_rejects_generic_root_readme_even_when_unchanged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            (root / "README.md").write_text("same", encoding="utf-8")
+            zip_path = Path(tmp) / "unrelated.zip"
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr("README.md", "same")
+
+            analysis = analyze_for_import(zip_path, root)
+
+            self.assertFalse(is_plausibly_for_project(analysis))
+
+    def test_project_match_rejects_generic_root_index_html(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            (root / "index.html").write_text("same", encoding="utf-8")
+            zip_path = Path(tmp) / "unrelated.zip"
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr("index.html", "changed")
+
+            analysis = analyze_for_import(zip_path, root)
+
+            self.assertFalse(is_plausibly_for_project(analysis))
+
+    def test_project_match_accepts_single_distinctive_changed_nested_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            (root / "src" / "pagevoice" / "offline").mkdir(parents=True)
+            target = root / "src" / "pagevoice" / "offline" / "DownloadPlanner.java"
+            target.write_text("old", encoding="utf-8")
+            zip_path = Path(tmp) / "partial.zip"
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr(
+                    "project/src/pagevoice/offline/DownloadPlanner.java", "new")
+
+            analysis = analyze_for_import(zip_path, root)
+
+            self.assertTrue(is_plausibly_for_project(analysis))
+
+    def test_project_match_rejects_two_generic_root_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            (root / "README.md").write_text("same", encoding="utf-8")
+            (root / "index.html").write_text("same", encoding="utf-8")
+            zip_path = Path(tmp) / "unrelated.zip"
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr("README.md", "changed")
+                zf.writestr("index.html", "changed")
+
+            analysis = analyze_for_import(zip_path, root)
+
+            self.assertFalse(is_plausibly_for_project(analysis))
+
+    def test_project_match_classifies_generic_overlap_as_uncertain(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            (root / "README.md").write_text("same", encoding="utf-8")
+            (root / "index.html").write_text("same", encoding="utf-8")
+            zip_path = Path(tmp) / "uncertain.zip"
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr("README.md", "changed")
+                zf.writestr("index.html", "changed")
+
+            analysis = analyze_for_import(zip_path, root)
+
+            self.assertEqual(
+                assess_project_match(analysis).level,
+                ProjectMatchLevel.UNCERTAIN,
+            )
+
+    def test_project_match_classifies_named_project_wrapper_as_likely(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "pagevoice"
+            root.mkdir()
+            zip_path = Path(tmp) / "named.zip"
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr("pagevoice/new_file.py", "new")
+
+            analysis = analyze_for_import(zip_path, root)
+
+            assessment = assess_project_match(analysis)
+            self.assertEqual(assessment.level, ProjectMatchLevel.LIKELY)
+            self.assertTrue(is_plausibly_for_project(analysis))
+
+    def test_project_match_filename_allows_partial_zip_with_descriptive_suffix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "llm-dropin"
+            root.mkdir()
+            zip_path = Path(tmp) / \
+                "llm-dropin-download-monitor-project-check2.zip"
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr("brand_new_file.py", "new")
+
+            analysis = analyze_for_import(zip_path, root)
+
+            self.assertTrue(analysis.archive_name_matches_project)
+            self.assertEqual(
+                assess_project_match(analysis).level,
+                ProjectMatchLevel.LIKELY,
+            )
+
+    def test_project_match_filename_ignores_duplicate_download_suffix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "llm-dropin"
+            root.mkdir()
+            zip_path = Path(tmp) / "llm-dropin(12).zip"
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr("only_new.py", "new")
+
+            analysis = analyze_for_import(zip_path, root)
+
+            self.assertTrue(analysis.archive_name_matches_project)
+            self.assertEqual(
+                assess_project_match(analysis).level,
+                ProjectMatchLevel.LIKELY,
+            )
+
+    def test_project_match_filename_normalizes_case_spaces_and_punctuation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "LLM-Drop In"
+            root.mkdir()
+            zip_path = Path(tmp) / "llm_drop-in_tooltip-fix.zip"
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr("only_new.py", "new")
+
+            analysis = analyze_for_import(zip_path, root)
+
+            self.assertTrue(analysis.archive_name_matches_project)
+            self.assertEqual(
+                assess_project_match(analysis).level,
+                ProjectMatchLevel.LIKELY,
+            )
+
+    def test_project_match_filename_treats_numeric_revision_as_project_prefix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "llm-dropin"
+            root.mkdir()
+            zip_path = Path(tmp) / "llm-dropin2.zip"
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr("only_new.py", "new")
+
+            analysis = analyze_for_import(zip_path, root)
+
+            self.assertTrue(analysis.archive_name_matches_project)
+            self.assertEqual(
+                assess_project_match(analysis).level,
+                ProjectMatchLevel.LIKELY,
+            )
+
+    def test_project_match_normalizes_project_folder_separators_too(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "LLM Drop-In"
+            root.mkdir()
+            zip_path = Path(tmp) / "llm-dropin-tooltip-fix.zip"
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr("only_new.py", "new")
+
+            analysis = analyze_for_import(zip_path, root)
+
+            self.assertTrue(analysis.archive_name_matches_project)
+            self.assertEqual(
+                assess_project_match(analysis).level,
+                ProjectMatchLevel.LIKELY,
+            )
+
+    def test_project_match_normalizes_named_wrapper_folder_separators(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "LLM Drop-In"
+            root.mkdir()
+            zip_path = Path(tmp) / "partial.zip"
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr("llm-drop_in/only_new.py", "new")
+
+            analysis = analyze_for_import(zip_path, root)
+
+            self.assertEqual(
+                assess_project_match(analysis).level,
+                ProjectMatchLevel.LIKELY,
+            )
+
+    def test_project_match_policy_matches_manual_and_automatic_matrix(self):
+        expected_manual = {
+            ProjectMatchLevel.LIKELY: ProjectMatchHandling.ALLOW,
+            ProjectMatchLevel.UNCERTAIN: ProjectMatchHandling.ALLOW,
+            ProjectMatchLevel.UNLIKELY: ProjectMatchHandling.WARN,
+        }
+        expected_automatic = {
+            ProjectMatchLevel.LIKELY: ProjectMatchHandling.ALLOW,
+            ProjectMatchLevel.UNCERTAIN: ProjectMatchHandling.WARN,
+            ProjectMatchLevel.UNLIKELY: ProjectMatchHandling.DISCARD,
+        }
+
+        for level, expected in expected_manual.items():
+            self.assertEqual(
+                project_match_handling(level, automatic=False), expected
+            )
+        for level, expected in expected_automatic.items():
+            self.assertEqual(
+                project_match_handling(level, automatic=True), expected
+            )
+
+    def test_project_match_rejects_archive_with_only_new_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            (root / "existing.txt").write_text("existing", encoding="utf-8")
+            zip_path = Path(tmp) / "unrelated.zip"
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr("other-project/main.py", "print('hello')")
+                zf.writestr("other-project/config.json", "{}")
+
+            analysis = analyze_for_import(zip_path, root)
+
+            self.assertFalse(is_plausibly_for_project(analysis))
 
 
 class ImporterTests(unittest.TestCase):

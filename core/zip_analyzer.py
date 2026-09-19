@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path, PurePosixPath
 import hashlib
 import os
+import re
 import subprocess
+import unicodedata
 import zipfile
 
 _WINDOWS_NO_CONSOLE = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -32,6 +35,9 @@ class ZipCandidate:
     unchanged_count: int
     conflict_count: int
     considered_count: int
+    distinctive_mapped_count: int
+    unchanged_distinctive_count: int
+    project_root_prefix_match: bool
     score: float
 
 
@@ -44,6 +50,58 @@ class ImportAnalysis:
     archive_hashes: dict[str, str]
     existing_files: dict[str, tuple[Path, str | None]]
     ignored_archive_paths: set[str]
+    archive_name_matches_project: bool
+
+
+class ProjectMatchLevel(str, Enum):
+    LIKELY = "likely"
+    UNCERTAIN = "uncertain"
+    UNLIKELY = "unlikely"
+
+
+class ProjectMatchHandling(str, Enum):
+    ALLOW = "allow"
+    WARN = "warn"
+    DISCARD = "discard"
+
+
+@dataclass(frozen=True)
+class ProjectMatchAssessment:
+    level: ProjectMatchLevel
+    reason: str
+    candidate: ZipCandidate | None
+
+
+def project_match_handling(
+    level: ProjectMatchLevel,
+    *,
+    automatic: bool,
+) -> ProjectMatchHandling:
+    """Return the user-facing handling for a project-match level.
+
+    Manual selection is permissive except for a low-confidence match:
+
+    * likely -> allow
+    * uncertain -> allow
+    * unlikely -> warn
+
+    Automatic download monitoring is stricter:
+
+    * likely -> allow
+    * uncertain -> warn
+    * unlikely -> discard
+    """
+    if automatic:
+        return {
+            ProjectMatchLevel.LIKELY: ProjectMatchHandling.ALLOW,
+            ProjectMatchLevel.UNCERTAIN: ProjectMatchHandling.WARN,
+            ProjectMatchLevel.UNLIKELY: ProjectMatchHandling.DISCARD,
+        }[level]
+    return {
+        ProjectMatchLevel.LIKELY: ProjectMatchHandling.ALLOW,
+        ProjectMatchLevel.UNCERTAIN: ProjectMatchHandling.ALLOW,
+        ProjectMatchLevel.UNLIKELY: ProjectMatchHandling.WARN,
+    }[level]
 
 
 def _clean_archive_path(name: str) -> str:
@@ -187,6 +245,126 @@ def _git_ignored_paths(project_root: Path, paths: list[str]) -> set[str]:
     return {path for path in result.stdout.split("\0") if path}
 
 
+_GENERIC_BASENAMES = {
+    "readme", "readme.md", "readme.txt", "readme.rst",
+    "license", "license.md", "license.txt", "copying",
+    "changelog", "changelog.md", "changes.md",
+    "index.html", "index.htm", "index.js", "index.ts",
+    "index.jsx", "index.tsx", "index.css",
+    ".gitignore", ".gitattributes",
+}
+_GENERIC_DIRS = {
+    "src", "lib", "bin", "build", "dist", "test", "tests",
+    "docs", "doc", "static", "public", "assets",
+}
+
+
+def _path_distinctiveness(rel: str, project_root: Path) -> int:
+    parts = PurePosixPath(rel).parts
+    if not parts:
+        return 0
+    basename = parts[-1].casefold()
+    score = 0
+    if len(parts) >= 3:
+        score += 3
+    elif len(parts) == 2:
+        score += 1
+    if basename not in _GENERIC_BASENAMES:
+        score += 2
+    parent_names = {part.casefold() for part in parts[:-1]}
+    if parent_names - _GENERIC_DIRS:
+        score += 2
+    if len(parts) >= 4:
+        score += 1
+    return score
+
+
+def _candidate_root_name_matches(prefix: str, project_root: Path) -> bool:
+    if not prefix:
+        return False
+    parts = [part for part in prefix.rstrip("/").split("/") if part]
+    if len(parts) != 1:
+        return False
+    return _normalized_name(parts[0]) == _normalized_name(project_root.name)
+
+
+_DUPLICATE_SUFFIX_RE = re.compile(r"\(\d+\)$")
+_NAME_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
+
+
+def _normalized_name(name: str) -> str:
+    """Normalize a project/archive name for equality/prefix comparisons."""
+    normalized = unicodedata.normalize("NFKC", name).casefold()
+    normalized = _DUPLICATE_SUFFIX_RE.sub("", normalized).strip()
+    return "".join(char for char in normalized if char.isalnum())
+
+
+def _name_tokens(name: str) -> list[str]:
+    """Split a name into separator-independent, case-folded semantic tokens."""
+    normalized = unicodedata.normalize("NFKC", name).casefold()
+    normalized = _DUPLICATE_SUFFIX_RE.sub("", normalized).strip()
+    tokens = [token for token in _NAME_TOKEN_RE.findall(normalized) if token]
+    if tokens and tokens[-1].isdigit():
+        # A bare numeric suffix is normally a generated revision/duplicate marker.
+        tokens.pop()
+    elif tokens:
+        tokens[-1] = re.sub(r"\d+$", "", tokens[-1]) or tokens[-1]
+    return tokens
+
+
+def _normalized_names_plausibly_match(project_name: str, archive_name: str) -> bool:
+    """Return whether two names plausibly refer to the same project.
+
+    This deliberately models how generated ZIP names tend to evolve: they can
+    preserve the beginning of the project name and then replace/truncate the rest
+    with a descriptive suffix, e.g. ``very-long-llm-drop-in-fixed-final`` for
+    ``very-long-llm-drop-in-project-structure-name``.
+    """
+    if not project_name or not archive_name:
+        return False
+
+    project_normalized = _normalized_name(project_name)
+    archive_normalized = _normalized_name(archive_name)
+    if project_normalized == archive_normalized:
+        return True
+    if archive_normalized.startswith(project_normalized):
+        return True
+
+    project_tokens = _name_tokens(project_name)
+    archive_tokens = _name_tokens(archive_name)
+    if not project_tokens or not archive_tokens:
+        return False
+
+    shared = 0
+    for project_token, archive_token in zip(project_tokens, archive_tokens):
+        if project_token != archive_token:
+            break
+        shared += 1
+
+    if shared == len(project_tokens):
+        return True
+
+    # A truncated project name may be followed by a replacement/descriptive suffix.
+    # Require a meaningful token-boundary prefix rather than arbitrary character overlap.
+    if shared < min(3, len(project_tokens)):
+        return False
+    coverage = shared / len(project_tokens)
+    shared_chars = len("".join(project_tokens[:shared]))
+    return coverage >= 0.50 and shared_chars >= 10
+
+
+def _archive_name_matches_project(archive_name: str, project_root: Path) -> bool:
+    """Return whether the archive filename plausibly names this project.
+
+    Generated ZIPs commonly add descriptive suffixes, while downloaded ZIPs can
+    also have a project name truncated from the end. Both directions are therefore
+    treated as a heuristic project-name match. Archive contents remain authoritative.
+    """
+    return _normalized_names_plausibly_match(
+        project_root.name, Path(archive_name).stem
+    )
+
+
 def _build_candidates(
     entries: list[ZipEntry],
     project_root: Path,
@@ -198,8 +376,8 @@ def _build_candidates(
     # node_modules, build outputs, caches, or large generated files. Instead,
     # inspect only destination paths that occur in the archive, and only hash
     # files after the candidates with the largest archive coverage are known.
-    provisional: list[tuple[str, int, int,
-                            int, int, list[tuple[str, str]]]] = []
+    provisional: list[tuple[str, int, int, int,
+                            int, list[tuple[str, str]], int]] = []
     max_considered = 0
 
     for prefix in candidate_prefixes(entries):
@@ -238,15 +416,21 @@ def _build_candidates(
         if not paths or conflicts:
             continue
         max_considered = max(max_considered, considered)
+        distinctive_mapped = sum(
+            _path_distinctiveness(rel, project_root) >= 4
+            and rel.casefold() in existing
+            for rel, _ in paths
+        )
         provisional.append(
-            (prefix, mapped, new, conflicts, considered, paths)
+            (prefix, mapped, new, conflicts, considered, paths, distinctive_mapped)
         )
 
     candidates: list[ZipCandidate] = []
     # The candidate sort always ranks considered_count first, so unchanged-file
     # hashes only matter for candidates tied at the maximum coverage.
-    for prefix, mapped, new, conflicts, considered, paths in provisional:
+    for prefix, mapped, new, conflicts, considered, paths, distinctive_mapped in provisional:
         unchanged = 0
+        unchanged_distinctive = 0
         if considered == max_considered:
             for rel, archive_path in paths:
                 cached = existing.get(rel.casefold())
@@ -258,11 +442,24 @@ def _build_candidates(
                     existing[rel.casefold()] = (existing_path, old_hash)
                 if old_hash == archive_hashes[archive_path]:
                     unchanged += 1
+                    if _path_distinctiveness(rel, project_root) >= 4:
+                        unchanged_distinctive += 1
 
-        score = (unchanged * 12 + mapped * 5 + new) / max(1, considered)
+        root_name_match = _candidate_root_name_matches(prefix, project_root)
+        score = (
+            unchanged * 6
+            + unchanged_distinctive * 10
+            + distinctive_mapped * 4
+            + mapped * 2
+            + (3 if root_name_match else 0)
+            + new
+        ) / max(1, considered)
         candidates.append(
-            ZipCandidate(prefix, mapped, new, unchanged,
-                         conflicts, considered, score)
+            ZipCandidate(
+                prefix, mapped, new, unchanged, conflicts, considered,
+                distinctive_mapped, unchanged_distinctive, root_name_match,
+                score,
+            )
         )
 
     candidates.sort(
@@ -328,7 +525,89 @@ def analyze_for_import(
         archive_hashes=archive_hashes,
         existing_files=existing,
         ignored_archive_paths=ignored,
+        archive_name_matches_project=_archive_name_matches_project(
+            zip_path.name, project_root
+        ),
     )
+
+
+def assess_project_match(
+    analysis: ImportAnalysis,
+) -> ProjectMatchAssessment:
+    """Classify how strongly an archive appears to belong to this project.
+
+    The classification is intentionally asymmetric for the automatic download
+    flow:
+
+    * likely: enough project-specific evidence exists to proceed directly to the
+      normal review dialog;
+    * uncertain: there is some overlap, but not enough to trust silently;
+    * unlikely: the archive contains no meaningful evidence tying it to the
+      current project.
+
+    Generic filenames such as README.md and index.html never establish a
+    ``likely`` match by themselves. A partial archive can still be likely when a
+    changed file has a distinctive project-specific path, which is important for
+    bandwidth-saving LLM responses that contain only changed files.
+    """
+    candidates = analysis.filtered_candidates or analysis.included_candidates
+    if analysis.archive_name_matches_project:
+        best = candidates[0] if candidates else None
+        return ProjectMatchAssessment(
+            ProjectMatchLevel.LIKELY,
+            "The archive filename matches the current project name.",
+            best,
+        )
+
+    if not candidates:
+        return ProjectMatchAssessment(
+            ProjectMatchLevel.UNLIKELY,
+            "The ZIP has no usable file structure to compare with this project.",
+            None,
+        )
+
+    best = candidates[0]
+
+    if best.project_root_prefix_match and best.considered_count:
+        return ProjectMatchAssessment(
+            ProjectMatchLevel.LIKELY,
+            "The archive root matches the current project folder name.",
+            best,
+        )
+
+    if best.unchanged_distinctive_count:
+        return ProjectMatchAssessment(
+            ProjectMatchLevel.LIKELY,
+            "At least one distinctive project file matches the current contents.",
+            best,
+        )
+
+    if best.distinctive_mapped_count:
+        return ProjectMatchAssessment(
+            ProjectMatchLevel.LIKELY,
+            "At least one distinctive project path already exists in this project.",
+            best,
+        )
+
+    if best.mapped_count:
+        return ProjectMatchAssessment(
+            ProjectMatchLevel.UNCERTAIN,
+            "The archive contains files that also exist in this project, but the paths are not distinctive enough to identify it reliably.",
+            best,
+        )
+
+    return ProjectMatchAssessment(
+        ProjectMatchLevel.UNLIKELY,
+        "The archive contains no meaningful paths that identify the current project.",
+        best,
+    )
+
+
+def is_plausibly_for_project(
+    analysis: ImportAnalysis,
+) -> bool:
+    """Backward-compatible helper for callers that only need a strong match."""
+    return assess_project_match(analysis).level == ProjectMatchLevel.LIKELY
 
 
 def analyze_variants(

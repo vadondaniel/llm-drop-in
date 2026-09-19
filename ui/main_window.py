@@ -7,14 +7,18 @@ from pathlib import Path
 from PySide6.QtCore import QObject, QThread, Qt, Signal, QMimeData, QUrl, QPoint, QTimer
 from PySide6.QtGui import QAction, QDrag, QDragEnterEvent, QDropEvent, QMouseEvent
 from PySide6.QtWidgets import (
-    QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
+    QApplication, QCheckBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
     QMessageBox, QPushButton, QVBoxLayout, QWidget, QListWidget, QListWidgetItem,
     QDialog, QProgressBar, QAbstractItemView, QComboBox, QMenu,
 )
 
+from core.download_monitor import DownloadFolderMonitor
 from core.importer import apply_import, cleanup_orphaned_transactions, history_entry, make_plan, undo_import
 from core.settings import add_history, load_history, load_settings, save_settings, update_history_entry, remember_project
-from core.zip_analyzer import ImportAnalysis, analyze_for_import
+from core.zip_analyzer import (
+    ImportAnalysis, ProjectMatchHandling, ProjectMatchLevel, assess_project_match,
+    analyze_for_import, project_match_handling,
+)
 from core.packer import (
     PACKAGE_HEAD,
     PACKAGE_STAGED,
@@ -366,6 +370,15 @@ class MainWindow(QMainWindow):
         self._pending_plan = None
         self._worker_kind: str | None = None
         self._package_artifact: DraggableArchive | None = None
+        self._download_monitor = DownloadFolderMonitor(
+            Path(self.settings.get("download_folder")
+                 or (Path.home() / "Downloads"))
+        )
+        self._download_monitor_timer: QTimer | None = None
+        self._download_queue: list[Path] = []
+        self._download_queue_keys: set[str] = set()
+        self._analysis_source: str = "manual"
+        self._review_dialog_active = False
         self._cleanup_stale_transactions()
         self._build()
         app = QApplication.instance()
@@ -373,6 +386,7 @@ class MainWindow(QMainWindow):
             app.paletteChanged.connect(self._theme_changed)
         self._theme_changed()
         self._refresh()
+        self._start_download_monitor_if_enabled()
 
     @staticmethod
     def _valid_project(path: Path | None) -> bool:
@@ -425,6 +439,116 @@ class MainWindow(QMainWindow):
         remember_project(self.settings, self.project)
         save_settings(self.settings)
         self._refresh()
+
+    def _download_monitor_toggled(self, enabled: bool) -> None:
+        self.settings["download_monitor_enabled"] = bool(enabled)
+        save_settings(self.settings)
+        if not enabled:
+            self._download_queue.clear()
+            self._download_queue_keys.clear()
+        self._sync_download_monitor()
+
+    def _choose_download_folder(self) -> None:
+        current = Path(
+            self.settings.get("download_folder")
+            or (Path.home() / "Downloads")
+        )
+        path = QFileDialog.getExistingDirectory(
+            self,
+            "Select downloads folder",
+            str(current) if current.exists() else str(Path.home()),
+        )
+        if not path:
+            return
+        folder = Path(path).resolve()
+        self.settings["download_folder"] = str(folder)
+        save_settings(self.settings)
+        self.download_folder.setText(str(folder))
+        self._download_queue.clear()
+        self._download_queue_keys.clear()
+        self._sync_download_monitor(seed_existing=True)
+
+    def _start_download_monitor_if_enabled(self) -> None:
+        self._sync_download_monitor(seed_existing=True)
+
+    def _sync_download_monitor(self, *, seed_existing: bool = True) -> None:
+        enabled = bool(self.settings.get("download_monitor_enabled", False))
+        folder = Path(
+            self.settings.get("download_folder")
+            or (Path.home() / "Downloads")
+        ).expanduser()
+        self.download_folder.setText(str(folder))
+        if not enabled:
+            self._download_monitor.stop()
+            if self._download_monitor_timer is not None:
+                self._download_monitor_timer.stop()
+            return
+
+        self._download_monitor.set_folder(folder, seed_existing=seed_existing)
+        if self._download_monitor_timer is None:
+            self._download_monitor_timer = QTimer(self)
+            self._download_monitor_timer.setInterval(750)
+            self._download_monitor_timer.timeout.connect(
+                self._poll_download_monitor)
+        self._download_monitor_timer.start()
+        if not folder.is_dir():
+            self._set_status("Download folder is unavailable", error=True)
+        elif self.worker_thread is None and not self._download_queue:
+            self._set_status("Watching downloads")
+
+    @staticmethod
+    def _path_key(path: Path) -> str:
+        try:
+            return str(path.resolve()).casefold()
+        except OSError:
+            return str(path).casefold()
+
+    def _is_generated_package_for_project(self, path: Path) -> bool:
+        project = self.project
+        if project is None or not self._valid_project(project):
+            return False
+        base = project.resolve().name or "project"
+        return path.resolve() in {
+            project.resolve().parent / f"{base}.zip",
+            project.resolve().parent / f"{base}-staged.zip",
+            project.resolve().parent / f"{base}-head.zip",
+        }
+
+    def _enqueue_download_zip(self, path: Path) -> None:
+        if path.suffix.lower() != ".zip" or not path.is_file():
+            return
+        if self._is_generated_package_for_project(path):
+            return
+        key = self._path_key(path)
+        if key in self._download_queue_keys:
+            return
+        if self._pending_zip is not None and self._path_key(self._pending_zip) == key:
+            return
+        self._download_queue.append(path)
+        self._download_queue_keys.add(key)
+        self._drain_download_queue()
+
+    def _drain_download_queue(self) -> None:
+        if self.worker_thread is not None or self._review_dialog_active:
+            return
+        project = self.project
+        if project is None or not self._valid_project(project):
+            return
+        while self._download_queue:
+            path = self._download_queue.pop(0)
+            self._download_queue_keys.discard(self._path_key(path))
+            if not path.is_file() or path.suffix.lower() != ".zip":
+                continue
+            self._analysis_source = "download"
+            self._start_zip_analysis(path)
+            return
+
+    def _poll_download_monitor(self) -> None:
+        ready = self._download_monitor.poll()
+        for path in ready:
+            self._enqueue_download_zip(path)
+        if ready and self.worker_thread is None and self._download_queue:
+            self._drain_download_queue()
 
     def _build(self):
         root = QWidget()
@@ -535,6 +659,49 @@ class MainWindow(QMainWindow):
         choose.clicked.connect(self.choose_project)
         project_row.addWidget(choose)
         project_layout.addLayout(project_row)
+
+        monitor_row = QHBoxLayout()
+        monitor_row.setSpacing(8)
+        self.download_monitor_toggle = QCheckBox("Watch downloads")
+        self.download_monitor_toggle.setObjectName("DownloadMonitorToggle")
+        set_style_class(self.download_monitor_toggle, "check-option")
+        self.download_monitor_toggle.setToolTip(
+            "Watch the selected folder for newly downloaded ZIPs. "
+            "The app waits for the file to finish downloading before "
+            "analyzing it for the current project."
+        )
+        self.download_monitor_toggle.setChecked(
+            bool(self.settings.get("download_monitor_enabled", False))
+        )
+        self.download_monitor_toggle.toggled.connect(
+            self._download_monitor_toggled
+        )
+        monitor_row.addWidget(self.download_monitor_toggle)
+
+        self.download_folder = QLineEdit()
+        self.download_folder.setReadOnly(True)
+        self.download_folder.setMinimumHeight(34)
+        set_style_class(self.download_folder, "input")
+        self.download_folder.setToolTip(
+            "Folder watched for newly downloaded ZIP files."
+        )
+        self.download_folder.setText(
+            str(self.settings.get("download_folder")
+                or (Path.home() / "Downloads"))
+        )
+        monitor_row.addWidget(self.download_folder, 1)
+
+        self.download_folder_button = QPushButton("Choose…")
+        self.download_folder_button.setObjectName("SecondaryButton")
+        set_style_class(self.download_folder_button, "secondary-button")
+        self.download_folder_button.setMinimumHeight(34)
+        self.download_folder_button.setToolTip(
+            "Choose the folder to monitor for downloaded ZIPs.")
+        self.download_folder_button.clicked.connect(
+            self._choose_download_folder)
+        monitor_row.addWidget(self.download_folder_button)
+        project_layout.addLayout(monitor_row)
+
         main_column.addWidget(project_card)
         self._refresh_recent_projects()
 
@@ -711,6 +878,8 @@ class MainWindow(QMainWindow):
             self._restore_latest_package()
             if not self.progress.isVisible():
                 self._set_status("Ready")
+            if self._download_queue and self.worker_thread is None:
+                QTimer.singleShot(0, self._drain_download_queue)
         else:
             self.project = None
             self._refresh_recent_projects()
@@ -859,9 +1028,16 @@ class MainWindow(QMainWindow):
     def receive_zip(self, path: Path | None):
         if self.worker_thread is not None:
             return
+        self._analysis_source = "manual"
         if path is None:
+            default_folder = Path(
+                self.settings.get("download_folder")
+                or (Path.home() / "Downloads")
+            ).expanduser()
+            if not default_folder.is_dir():
+                default_folder = Path.home()
             path_str, _ = QFileDialog.getOpenFileName(
-                self, "Select LLM ZIP", str(Path.home()), "ZIP files (*.zip)")
+                self, "Select LLM ZIP", str(default_folder), "ZIP files (*.zip)")
             if not path_str:
                 return
             path = Path(path_str)
@@ -874,11 +1050,20 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Invalid file",
                                 "Please select a ZIP archive.")
             return
+        self._start_zip_analysis(path)
+
+    def _start_zip_analysis(self, path: Path) -> None:
+        project = self.project
+        if project is None or not project.exists() or not project.is_dir():
+            return
+        if not path.is_file() or path.suffix.lower() != ".zip":
+            return
         self._pending_zip = path
         self._worker_kind = "analyze"
         self.drop.setEnabled(False)
         self.progress.show()
-        self._set_status(f"Analyzing {path.name}…", active=True)
+        prefix = "downloaded " if self._analysis_source == "download" else ""
+        self._set_status(f"Analyzing {prefix}{path.name}…", active=True)
         self.worker_thread = QThread(self)
         self.worker = ZipWorker(path, project)
         self.worker.moveToThread(self.worker_thread)
@@ -901,10 +1086,16 @@ class MainWindow(QMainWindow):
         self.package_button.setEnabled(True)
         self._worker_kind = None
         self._history_selection_changed()
+        if self._download_queue:
+            QTimer.singleShot(0, self._drain_download_queue)
 
     def _analysis_failed(self, message: str):
-        QMessageBox.critical(self, "Could not analyze ZIP", message)
-        self._set_status("Analysis failed", error=True)
+        if self._analysis_source == "download":
+            self._set_status(
+                "Downloaded ZIP could not be analyzed", error=True)
+        else:
+            QMessageBox.critical(self, "Could not analyze ZIP", message)
+            self._set_status("Analysis failed", error=True)
 
     def _analysis_ready(self, path, analysis: ImportAnalysis):
         project = self.project
@@ -918,9 +1109,60 @@ class MainWindow(QMainWindow):
         included_candidates = analysis.included_candidates
         detection_candidates = candidates or included_candidates
         if not detection_candidates:
-            QMessageBox.warning(self, "No usable structure",
-                                "The ZIP does not contain any safe file paths that can be mapped into this project.")
+            if self._analysis_source == "download":
+                self._set_status(
+                    "Downloaded ZIP has no usable project structure", error=True)
+            else:
+                QMessageBox.warning(
+                    self,
+                    "No usable structure",
+                    "The ZIP does not contain any safe file paths that can be mapped into this project.",
+                )
             return
+
+        match = assess_project_match(analysis)
+        automatic = self._analysis_source == "download"
+        handling = project_match_handling(match.level, automatic=automatic)
+
+        if handling == ProjectMatchHandling.DISCARD:
+            self._pending_zip = None
+            self._set_status(
+                "Downloaded ZIP was discarded: it does not appear to belong to this project"
+            )
+            return
+
+        if handling == ProjectMatchHandling.WARN:
+            if match.level == ProjectMatchLevel.UNLIKELY:
+                title = "ZIP may belong to another project"
+                message = (
+                    "This ZIP does not contain meaningful evidence that it belongs to the current project.\n\n"
+                    f"{match.reason}\n\n"
+                    "Import it anyway?"
+                )
+                default = QMessageBox.StandardButton.No
+            else:
+                title = "ZIP project match is uncertain"
+                message = (
+                    "This downloaded ZIP may belong to the current project, but the match is uncertain.\n\n"
+                    f"{match.reason}\n\n"
+                    "Continue to the import review?"
+                )
+                default = QMessageBox.StandardButton.Yes
+
+            answer = QMessageBox.warning(
+                self,
+                title,
+                message,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                default,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                self._pending_zip = None
+                self._set_status(
+                    "Download discarded" if automatic else "Import cancelled"
+                )
+                return
+
         best = detection_candidates[0]
         ties = [c for c in detection_candidates if (
             c.considered_count, c.unchanged_count, c.mapped_count, round(
@@ -930,9 +1172,13 @@ class MainWindow(QMainWindow):
                 best.score, 6)
         )]
         if len(ties) > 1 and best.prefix != ties[1].prefix:
-            QMessageBox.warning(self, "Ambiguous ZIP structure",
-                                "More than one ZIP root fits the project equally well. The import was not applied.")
-            self._set_status("Waiting for another archive")
+            if self._analysis_source == "download":
+                self._set_status(
+                    "Downloaded ZIP has ambiguous project structure", error=True)
+            else:
+                QMessageBox.warning(self, "Ambiguous ZIP structure",
+                                    "More than one ZIP root fits the project equally well. The import was not applied.")
+                self._set_status("Waiting for another archive")
             return
         try:
             plan = make_plan(
@@ -955,20 +1201,35 @@ class MainWindow(QMainWindow):
                 if item.archive_path not in filtered_archive_paths
             ]
         except Exception as exc:
-            QMessageBox.critical(self, "Unsafe import", str(exc))
-            self._set_status("Import could not be prepared", error=True)
+            if self._analysis_source == "download":
+                self._set_status(
+                    "Downloaded ZIP could not be safely prepared", error=True)
+            else:
+                QMessageBox.critical(self, "Unsafe import", str(exc))
+                self._set_status("Import could not be prepared", error=True)
             return
         if not included_plan:
-            QMessageBox.warning(self, "Nothing to import",
-                                "No files were found after the detected ZIP root.")
-            self._set_status("Nothing to import")
+            if self._analysis_source == "download":
+                self._set_status("Downloaded ZIP contains nothing to import")
+            else:
+                QMessageBox.warning(self, "Nothing to import",
+                                    "No files were found after the detected ZIP root.")
+                self._set_status("Nothing to import")
             return
         dialog = ImportPreviewDialog(
             project, project.name, best.prefix, plan, included_plan,
             gitignored_plan, path, self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            self._set_status("Import cancelled")
+        self._review_dialog_active = True
+        try:
+            accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        finally:
+            self._review_dialog_active = False
+        if not accepted:
+            self._set_status(
+                "Download analysis cancelled" if self._analysis_source == "download" else "Import cancelled")
             self._pending_zip = None
+            if self._download_queue:
+                QTimer.singleShot(0, self._drain_download_queue)
             return
         selected = dialog.selected
         self._pending_zip = path
@@ -998,6 +1259,7 @@ class MainWindow(QMainWindow):
             self._set_status(f"Imported {applied} files from {path.name}")
         self._pending_zip = None
         self._pending_plan = None
+        self._analysis_source = "manual"
 
     def _undo_history_item(self):
         if self.worker_thread is not None:
@@ -1037,3 +1299,9 @@ class MainWindow(QMainWindow):
         self._set_status("Import rolled back", error=True)
         self._pending_zip = None
         self._pending_plan = None
+
+    def closeEvent(self, event):
+        self._download_monitor.stop()
+        if self._download_monitor_timer is not None:
+            self._download_monitor_timer.stop()
+        super().closeEvent(event)

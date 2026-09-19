@@ -18,7 +18,12 @@ def _load(path: Path, default):
 
 
 def load_settings() -> dict:
-    settings = _load(SETTINGS_FILE, {"project": "", "recent_projects": []})
+    settings = _load(SETTINGS_FILE, {
+        "project": "",
+        "recent_projects": [],
+        "download_monitor_enabled": False,
+        "download_folder": str(Path.home() / "Downloads"),
+    })
     if not isinstance(settings, dict):
         settings = {}
     recent = settings.get("recent_projects", [])
@@ -36,6 +41,11 @@ def load_settings() -> dict:
         cleaned.append(value)
     settings["recent_projects"] = cleaned[:15]
     settings.setdefault("project", cleaned[0] if cleaned else "")
+    if not isinstance(settings.get("download_monitor_enabled"), bool):
+        settings["download_monitor_enabled"] = False
+    download_folder = settings.get("download_folder")
+    if not isinstance(download_folder, str) or not download_folder:
+        settings["download_folder"] = str(Path.home() / "Downloads")
     return settings
 
 
