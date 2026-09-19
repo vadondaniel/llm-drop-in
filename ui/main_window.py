@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from html import escape
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QThread, Qt, Signal
@@ -75,14 +76,12 @@ class DropArea(QFrame):
         self.title.setObjectName("DropTitle")
         set_style_class(self.title, "drop-title")
         self.title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.hint = QLabel("or click to browse for a .zip archive")
-        self.hint.setObjectName("DropHint")
-        set_style_class(self.hint, "hint")
-        self.hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.title.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setToolTip("Drop a ZIP here, or click to choose one.")
 
         layout.addStretch()
         layout.addWidget(self.title)
-        layout.addWidget(self.hint)
         layout.addStretch()
 
     def mousePressEvent(self, event):
@@ -195,12 +194,7 @@ class MainWindow(QMainWindow):
         title = QLabel("LLM Drop-In")
         title.setObjectName("WindowTitle")
         set_style_class(title, "title")
-        subtitle = QLabel(
-            "Review generated changes before they touch your project.")
-        subtitle.setObjectName("WindowSubtitle")
-        set_style_class(subtitle, "subtitle")
         title_block.addWidget(title)
-        title_block.addWidget(subtitle)
         header.addLayout(title_block, 1)
         layout.addLayout(header)
 
@@ -225,10 +219,6 @@ class MainWindow(QMainWindow):
         set_style_class(project_title, "card-title")
         project_header.addWidget(project_title)
         project_header.addStretch()
-        project_hint = QLabel("The ZIP is matched against this folder.")
-        project_hint.setObjectName("CardHint")
-        set_style_class(project_hint, "hint")
-        project_header.addWidget(project_hint)
         project_layout.addLayout(project_header)
         project_row = QHBoxLayout()
         project_row.setSpacing(10)
@@ -261,11 +251,6 @@ class MainWindow(QMainWindow):
         set_style_class(import_title, "card-title")
         import_header.addWidget(import_title)
         import_header.addStretch()
-        import_hint = QLabel(
-            "Drop a ZIP to inspect it before applying anything.")
-        import_hint.setObjectName("CardHint")
-        set_style_class(import_hint, "hint")
-        import_header.addWidget(import_hint)
         import_layout.addLayout(import_header)
         self.drop = DropArea(self.receive_zip)
         self.drop.setMinimumHeight(220)
@@ -277,7 +262,7 @@ class MainWindow(QMainWindow):
         status_layout = QHBoxLayout(status_bar)
         status_layout.setContentsMargins(2, 2, 2, 0)
         status_layout.setSpacing(9)
-        self.status_dot = QLabel("●")
+        self.status_dot: QLabel = QLabel("●")
         self.status_dot.setObjectName("StatusDot")
         set_style_class(self.status_dot, "status-dot")
         status_layout.addWidget(self.status_dot)
@@ -299,8 +284,7 @@ class MainWindow(QMainWindow):
         history_card = QFrame()
         history_card.setObjectName("HistorySidebar")
         set_style_class(history_card, "surface-sidebar")
-        history_card.setMinimumWidth(290)
-        history_card.setMaximumWidth(360)
+        history_card.setMinimumWidth(320)
         history_layout = QVBoxLayout(history_card)
         history_layout.setContentsMargins(16, 16, 16, 14)
         history_layout.setSpacing(10)
@@ -311,12 +295,6 @@ class MainWindow(QMainWindow):
         history_title.setObjectName("CardTitle")
         set_style_class(history_title, "card-title")
         history_header.addWidget(history_title)
-        history_hint = QLabel(
-            "Imports for the current project.")
-        history_hint.setObjectName("CardHint")
-        set_style_class(history_hint, "hint")
-        history_hint.setWordWrap(True)
-        history_header.addWidget(history_hint)
         history_layout.addLayout(history_header)
 
         self.history = QListWidget()
@@ -333,27 +311,31 @@ class MainWindow(QMainWindow):
         self.history.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.history.setUniformItemSizes(False)
+        self.history.setMouseTracking(True)
         history_layout.addWidget(self.history, 1)
-
-        self.history_summary = QLabel("No imports yet")
-        self.history_summary.setObjectName("HistorySummary")
-        set_style_class(self.history_summary, "subtle")
-        history_layout.addWidget(self.history_summary)
 
         self.undo = QPushButton("Undo selected import")
         self.undo.setObjectName("SecondaryButton")
         set_style_class(self.undo, "secondary-button")
         self.undo.setMinimumHeight(38)
         self.undo.setEnabled(False)
+        self.undo.setToolTip(
+            "Revert the selected import while the imported files are still unchanged."
+        )
         self.undo.clicked.connect(self._undo_history_item)
         history_layout.addWidget(self.undo)
 
-        body_layout.addLayout(main_column, 1)
-        body_layout.addWidget(history_card, 0)
+        body_layout.addLayout(main_column, 3)
+        body_layout.addWidget(history_card, 2)
         layout.addWidget(body, 1)
 
     def _theme_changed(self, _palette=None):
         self._theme_tokens = apply_theme(self)
+        app = QApplication.instance()
+        tooltip_controller = app.property(
+            "tooltipController") if app is not None else None
+        if tooltip_controller is not None and hasattr(tooltip_controller, "refresh_theme"):
+            tooltip_controller.refresh_theme()
         self._apply_status_dot_style(self._theme_tokens)
 
     def _apply_status_dot_style(self, tokens):
@@ -426,11 +408,6 @@ class MainWindow(QMainWindow):
                 self._set_status("Select a project folder to get started.")
         self.history.clear()
         entries = self._history_for_current_project()[:15]
-        self.history_summary.setText(
-            f"{len(entries)} recent import{'s' if len(entries) != 1 else ''}"
-            if entries
-            else ("No imports for this project" if self.project else "No project selected")
-        )
         for entry in entries:
             ts = entry.get("timestamp", "").replace("T", " ")
             name = Path(entry.get("zip", "")).name
@@ -443,6 +420,11 @@ class MainWindow(QMainWindow):
             state = "UNDONE" if entry.get("undone") else "COMPLETED"
             msg = f"{name}\n{counts}  ·  {ts}  ·  {state}"
             item = QListWidgetItem(msg)
+            item.setToolTip(
+                f"<b>{escape(name)}</b><br>"
+                f"{escape(counts)}<br>"
+                f"{escape(ts)} · {escape(state)}"
+            )
             item.setData(Qt.ItemDataRole.UserRole, entry)
             self.history.addItem(item)
         self._history_selection_changed()

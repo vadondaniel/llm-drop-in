@@ -202,7 +202,7 @@ def _apply_class(widget: QWidget, class_name: str, tokens: ThemeTokens) -> None:
         _set_font(widget, point_size=22, bold=True)
     elif class_name == "preview-title":
         _set_font(widget, point_size=20, bold=True)
-    elif class_name in {"subtitle", "hint"}:
+    elif class_name == "subtitle":
         _set_text_color(widget, tokens.text_muted)
     elif class_name == "subtle":
         _set_text_color(widget, tokens.text_subtle)
@@ -322,9 +322,6 @@ def _apply_class(widget: QWidget, class_name: str, tokens: ThemeTokens) -> None:
     elif class_name == "stat-label":
         _set_font(widget, bold=True)
         _set_text_color(widget, tokens.text_muted)
-    elif class_name == "stat-hint":
-        _set_text_color(widget, tokens.text_subtle)
-        _set_font(widget, point_size=9)
     elif class_name == "diff-swatch-added":
         widget.setStyleSheet(
             f"*[styleClass=\"diff-swatch-added\"] {{ background: {_css(tokens.success_bg)}; border: 1px solid {_css(tokens.success_fg)}; border-radius: 3px; }}")

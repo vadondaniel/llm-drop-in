@@ -311,12 +311,9 @@ class ImportPreviewDialog(QDialog):
         label_widget = QLabel(label)
         label_widget.setObjectName("StatLabel")
         set_style_class(label_widget, "stat-label")
-        hint_widget = QLabel(hint)
-        hint_widget.setObjectName("StatHint")
-        set_style_class(hint_widget, "stat-hint")
+        block.setToolTip(hint)
         layout.addWidget(value_label)
         layout.addWidget(label_widget)
-        layout.addWidget(hint_widget)
         grid.addWidget(block, 0, column)
 
     def _include_gitignored_changed(self, enabled: bool):

@@ -4,11 +4,14 @@ import sys
 from PySide6.QtWidgets import QApplication
 
 from ui.main_window import MainWindow
+from ui.tooltip import StyledToolTipController
 
 
 def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("LLM Drop-In")
+    tooltip_controller = StyledToolTipController(app)
+    app.setProperty("tooltipController", tooltip_controller)
     window = MainWindow()
     window.show()
     return app.exec()
