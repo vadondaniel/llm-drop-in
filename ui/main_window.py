@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QThread, Qt, Signal, QMimeData, QUrl, QPoint
-from PySide6.QtGui import QAction, QDrag, QDragEnterEvent, QDropEvent
+from PySide6.QtCore import QObject, QThread, Qt, Signal, QMimeData, QUrl, QPoint, QTimer
+from PySide6.QtGui import QAction, QDrag, QDragEnterEvent, QDropEvent, QMouseEvent
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
     QMessageBox, QPushButton, QVBoxLayout, QWidget, QListWidget, QListWidgetItem,
@@ -20,6 +21,7 @@ from core.packer import (
     PACKAGE_WORKTREE,
     PackageResult,
     package_project,
+    discover_latest_package,
 )
 from ui.import_preview import ImportPreviewDialog
 from ui.theme import apply_theme, set_style_class
@@ -129,13 +131,39 @@ class DropArea(QFrame):
         event.ignore()
 
 
+class DraggableArchiveLabel(QLabel):
+    """Tooltip-capable label that forwards drag gestures to its archive."""
+
+    def __init__(self, archive, text: str = ""):
+        super().__init__(text)
+        self.archive = archive
+
+    def mousePressEvent(self, event: QMouseEvent):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.archive._drag_press_global = event.globalPosition().toPoint()
+        event.accept()
+
+    def mouseMoveEvent(self, event: QMouseEvent):
+        if event.buttons() & Qt.MouseButton.LeftButton:
+            self.archive._try_start_drag(
+                event.buttons(), event.globalPosition().toPoint())
+        event.accept()
+
+    def mouseReleaseEvent(self, event: QMouseEvent):
+        self.archive._drag_press_global = None
+        event.accept()
+
+
 class DraggableArchive(QFrame):
     """A small file surface that can be dragged into another application."""
 
     def __init__(self, result: PackageResult, parent=None):
         super().__init__(parent)
         self.result = result
-        self._press_pos = None
+        self._drag_press_global: QPoint | None = None
+        self._created_at = datetime.fromtimestamp(
+            result.path.stat().st_mtime, tz=timezone.utc
+        )
         self.setObjectName("DraggableArchive")
         set_style_class(self, "surface-alt")
         self.setCursor(Qt.CursorShape.OpenHandCursor)
@@ -148,42 +176,92 @@ class DraggableArchive(QFrame):
         layout.setContentsMargins(12, 9, 12, 9)
         layout.setSpacing(2)
 
-        self.name_label = QLabel(result.path.name)
+        self.name_label = DraggableArchiveLabel(self)
         self.name_label.setObjectName("ArchiveName")
-        self.name_label.setAttribute(
-            Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         layout.addWidget(self.name_label)
 
+        metadata_layout = QHBoxLayout()
+        metadata_layout.setContentsMargins(0, 0, 0, 0)
+        metadata_layout.setSpacing(6)
+
         scope_names = {
+            PACKAGE_WORKTREE: "Working tree",
+            PACKAGE_STAGED: "Staged",
+            PACKAGE_HEAD: "HEAD",
+        }
+        self.scope_label = DraggableArchiveLabel(
+            self, scope_names.get(result.scope, result.scope)
+        )
+        self.scope_label.setObjectName("ArchiveMetadata")
+        self.scope_label.setToolTip(self._scope_tooltip(result.scope))
+        set_style_class(self.scope_label, "subtle")
+        metadata_layout.addWidget(self.scope_label)
+
+        self.detail_label = QLabel(
+            f"{result.files:,} files · {result.size_bytes / (1024 * 1024):.2f} MB"
+        )
+        self.detail_label.setObjectName("ArchiveMetadata")
+        self.detail_label.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        set_style_class(self.detail_label, "subtle")
+        metadata_layout.addWidget(self.detail_label, 1)
+
+        if result.missing:
+            missing_label = QLabel(f"{len(result.missing):,} missing")
+            missing_label.setObjectName("ArchiveMetadata")
+            missing_label.setAttribute(
+                Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+            set_style_class(missing_label, "subtle")
+            metadata_layout.addWidget(missing_label)
+
+        layout.addLayout(metadata_layout)
+        self._update_time_display()
+        self._time_timer = QTimer(self)
+        self._time_timer.setInterval(30_000)
+        self._time_timer.timeout.connect(self._update_time_display)
+        self._time_timer.start()
+
+    @staticmethod
+    def _scope_tooltip(scope: str) -> str:
+        return {
             PACKAGE_WORKTREE: "Working tree · tracked + non-ignored untracked files",
             PACKAGE_STAGED: "Staged state · current Git index",
             PACKAGE_HEAD: "HEAD · last committed state",
-        }
-        metadata = (
-            f"{scope_names.get(result.scope, result.scope)} · "
-            f"{result.files:,} files · {result.size_bytes / (1024 * 1024):.2f} MB"
+        }.get(scope, scope)
+
+    @staticmethod
+    def _relative_time(created_at: datetime, now: datetime | None = None) -> str:
+        now = now or datetime.now(timezone.utc)
+        seconds = int((now - created_at).total_seconds())
+        if seconds < 0:
+            seconds = 0
+        if seconds < 10:
+            return "just now"
+        if seconds < 60:
+            return f"{seconds}s ago"
+        minutes = seconds // 60
+        if minutes < 60:
+            return f"{minutes} min ago"
+        hours = minutes // 60
+        if hours < 24:
+            return f"{hours}h ago"
+        days = hours // 24
+        return f"{days}d ago"
+
+    def _update_time_display(self) -> None:
+        exact = self._created_at.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+        relative = self._relative_time(self._created_at)
+        self.name_label.setText(f"{self.result.path.name} · {relative}")
+        self.name_label.setToolTip(
+            f"<b>{escape(self.result.path.name)}</b><br>Created {escape(exact)}"
         )
-        if result.missing:
-            metadata += f" · {len(result.missing):,} missing"
-        self.metadata_label = QLabel(metadata)
-        self.metadata_label.setObjectName("ArchiveMetadata")
-        self.metadata_label.setAttribute(
-            Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        set_style_class(self.metadata_label, "subtle")
-        layout.addWidget(self.metadata_label)
 
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._press_pos = event.position().toPoint()
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event):
-        if self._press_pos is None or not (
-            event.buttons() & Qt.MouseButton.LeftButton
+    def _try_start_drag(self, buttons, global_pos: QPoint) -> None:
+        if self._drag_press_global is None or not (
+            buttons & Qt.MouseButton.LeftButton
         ):
             return
-        distance = (event.position().toPoint() -
-                    self._press_pos).manhattanLength()
+        distance = (global_pos - self._drag_press_global).manhattanLength()
         if distance < QApplication.startDragDistance():
             return
 
@@ -196,7 +274,23 @@ class DraggableArchive(QFrame):
             drag.exec(Qt.DropAction.CopyAction)
         finally:
             self.setCursor(Qt.CursorShape.OpenHandCursor)
-            self._press_pos = None
+            self._drag_press_global = None
+
+    def mousePressEvent(self, event: QMouseEvent):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_press_global = event.globalPosition().toPoint()
+        event.accept()
+
+    def mouseMoveEvent(self, event: QMouseEvent):
+        if event.buttons() & Qt.MouseButton.LeftButton:
+            self._try_start_drag(
+                event.buttons(), event.globalPosition().toPoint()
+            )
+        event.accept()
+
+    def mouseReleaseEvent(self, event: QMouseEvent):
+        self._drag_press_global = None
+        event.accept()
 
 
 class MainWindow(QMainWindow):
@@ -559,8 +653,10 @@ class MainWindow(QMainWindow):
             self._apply_status_dot_style(tokens)
 
     def _refresh(self):
+        self._clear_package_artifact()
         if self.project and self.project.exists() and self.project.is_dir():
             self._refresh_recent_projects()
+            self._restore_latest_package()
             if not self.progress.isVisible():
                 self._set_status("Ready")
         else:
@@ -590,6 +686,18 @@ class MainWindow(QMainWindow):
             item.setData(Qt.ItemDataRole.UserRole, entry)
             self.history.addItem(item)
         self._history_selection_changed()
+
+    def _restore_latest_package(self):
+        project = self.project
+        if project is None or not self._valid_project(project):
+            return
+        result = discover_latest_package(project)
+        if result is None:
+            return
+        self._package_artifact = DraggableArchive(
+            result, self.package_artifact_host)
+        self.package_artifact_layout.addWidget(self._package_artifact)
+        self.package_artifact_host.show()
 
     def _history_selection_changed(self):
         row = self.history.currentItem()

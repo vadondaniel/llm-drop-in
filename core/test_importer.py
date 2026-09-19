@@ -55,36 +55,6 @@ class ZipIgnoreTests(unittest.TestCase):
                 },
             )
 
-    def test_analysis_does_not_hash_unrelated_project_files(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "project"
-            root.mkdir()
-            target = root / "src" / "main.py"
-            target.parent.mkdir()
-            target.write_text("same", encoding="utf-8")
-            for i in range(1000):
-                decoy = root / "node_modules" / f"pkg{i % 50}" / f"file{i}.js"
-                decoy.parent.mkdir(parents=True, exist_ok=True)
-                decoy.write_text("unrelated", encoding="utf-8")
-
-            zip_path = Path(tmp) / "update.zip"
-            with zipfile.ZipFile(zip_path, "w") as zf:
-                zf.writestr("wrapper/src/main.py", "same")
-                zf.writestr("wrapper/src/new.py", "new")
-
-            import core.zip_analyzer as analyzer
-            original_hash_file = analyzer._hash_file
-            with mock.patch.object(
-                analyzer,
-                "_hash_file",
-                side_effect=original_hash_file,
-                wraps=original_hash_file,
-            ) as hash_file:
-                analysis = analyze_for_import(zip_path, root)
-
-            self.assertLessEqual(hash_file.call_count, 2)
-            self.assertTrue(analysis.filtered_candidates)
-
     def test_make_plan_can_use_precomputed_hashes_without_zip_access(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "project"

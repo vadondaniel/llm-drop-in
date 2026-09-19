@@ -13,6 +13,7 @@ from core.packer import (
     PACKAGE_WORKTREE,
     PackageError,
     package_project,
+    discover_latest_package,
 )
 
 
@@ -144,6 +145,97 @@ class PackageTests(unittest.TestCase):
             root.mkdir()
             with self.assertRaises(PackageError):
                 package_project(root)
+
+    def test_worktree_package_uses_canonical_name_and_replaces_previous(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._repo(tmp)
+            first = package_project(root, scope=PACKAGE_WORKTREE)
+            self.assertEqual(first.path.name, f"{root.name}.zip")
+            self.assertTrue(first.path.is_file())
+            first_bytes = first.path.read_bytes()
+
+            (root / "tracked.txt").write_bytes(b"updated\n")
+            second = package_project(root, scope=PACKAGE_WORKTREE)
+
+            self.assertEqual(second.path, first.path)
+            self.assertEqual(second.path.name, f"{root.name}.zip")
+            self.assertTrue(second.path.is_file())
+            self.assertNotEqual(second.path.read_bytes(), first_bytes)
+            self.assertEqual(
+                sorted(p.name for p in root.parent.glob(f"{root.name}*.zip")),
+                [f"{root.name}.zip"],
+            )
+
+    def test_scope_specific_packages_use_clear_names_and_are_independent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._repo(tmp)
+
+            worktree = package_project(root, scope=PACKAGE_WORKTREE)
+            staged = package_project(root, scope=PACKAGE_STAGED)
+            head = package_project(root, scope=PACKAGE_HEAD)
+
+            self.assertEqual(worktree.path.name, f"{root.name}.zip")
+            self.assertEqual(staged.path.name, f"{root.name}-staged.zip")
+            self.assertEqual(head.path.name, f"{root.name}-head.zip")
+            self.assertTrue(worktree.path.exists())
+            self.assertTrue(staged.path.exists())
+            self.assertTrue(head.path.exists())
+
+    def test_successful_replacement_leaves_no_temp_zip_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._repo(tmp)
+            result = package_project(root)
+
+            self.assertTrue(result.path.exists())
+            temp_entries = [
+                p for p in root.parent.iterdir()
+                if p.is_dir() and p.name.startswith(f".{result.path.stem}-")
+            ]
+            self.assertEqual(temp_entries, [])
+
+    def test_old_generated_names_are_removed_after_successful_replacement(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._repo(tmp)
+            old_names = [
+                f"{root.name}-v7-worktree.zip",
+                f"{root.name}-worktree-v8.zip",
+                f"{root.name}-llm-worktree-v9-20260919-120000.zip",
+                f"{root.name}-llm-20260919-120000.zip",
+            ]
+            for name in old_names:
+                (root.parent / name).write_bytes(b"old package")
+
+            result = package_project(root, scope=PACKAGE_WORKTREE)
+
+            self.assertEqual(result.path.name, f"{root.name}.zip")
+            for name in old_names:
+                self.assertFalse((root.parent / name).exists())
+
+    def test_discover_latest_package_finds_newest_scope_for_current_project(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._repo(tmp)
+            worktree = package_project(root, scope=PACKAGE_WORKTREE)
+            head = package_project(root, scope=PACKAGE_HEAD)
+            import os
+            os.utime(worktree.path, ns=(1_000_000_000, 1_000_000_000))
+            os.utime(head.path, ns=(2_000_000_000, 2_000_000_000))
+
+            discovered = discover_latest_package(root)
+
+            self.assertIsNotNone(discovered)
+            assert discovered is not None
+            self.assertEqual(discovered.path, head.path)
+            self.assertEqual(discovered.scope, PACKAGE_HEAD)
+            self.assertEqual(discovered.files, head.files)
+            self.assertEqual(discovered.size_bytes, head.size_bytes)
+
+    def test_discover_ignores_corrupt_canonical_package(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._repo(tmp)
+            corrupt = root.parent / f"{root.name}.zip"
+            corrupt.write_bytes(b"not a zip")
+
+            self.assertIsNone(discover_latest_package(root))
 
     def test_default_output_is_next_to_project_not_inside_it(self):
         with tempfile.TemporaryDirectory() as tmp:
