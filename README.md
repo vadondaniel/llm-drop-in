@@ -40,15 +40,16 @@ The download folder and monitoring setting are remembered between launches.
 
 ## Creating a ZIP for an LLM
 
-Click **Create ZIP** to package the current project.
+Click **Create ZIP** for the usual project export. Use the arrow next to it to choose a different export.
 
 You can choose between:
 
-- **Working tree** — the files currently in the project, including untracked files that are not ignored by Git.
+- **Working tree** — the files currently in the project, excluding files ignored by Git.
+- **Working tree (include ignored files)** — the same export, but also includes files that Git normally ignores.
 - **Staged** — the files you currently have staged in Git.
 - **HEAD** — the latest committed version in Git.
 
-Git-ignored files are excluded from the **Working tree** package.
+The **include ignored files** option is useful when the LLM needs something that normally is not included in a project export, such as local configuration or generated files. Depending on the project and technology stack, it can also make the ZIP significantly larger. Git-ignored files can contain machine-local or sensitive data, so check what is included before sending it to an LLM.
 
 Once the ZIP is created, it is available in the app as a draggable file, so you can drop it directly into a browser chat.
 

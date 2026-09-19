@@ -11,6 +11,7 @@ from core.packer import (
     PACKAGE_HEAD,
     PACKAGE_STAGED,
     PACKAGE_WORKTREE,
+    PACKAGE_WORKTREE_IGNORED,
     PackageError,
     package_project,
     discover_latest_package,
@@ -72,6 +73,27 @@ class PackageTests(unittest.TestCase):
             self.assertEqual(files["tracked.txt"], b"working tree\n")
             self.assertEqual(files["new.txt"], b"new\n")
             self.assertEqual(result.files, 4)
+
+    def test_worktree_with_ignored_includes_ignored_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._repo(tmp)
+            (root / "tracked.txt").write_bytes(b"working tree\n")
+            (root / "new.txt").write_bytes(b"new\n")
+            (root / "debug.log").write_bytes(b"ignored log\n")
+            (root / "ignored" / "new.txt").write_bytes(b"ignored nested\n")
+
+            result = package_project(root, scope=PACKAGE_WORKTREE_IGNORED)
+            files = self._read_zip(result.path)
+
+            self.assertEqual(
+                set(files),
+                {".gitignore", "keep.txt", "new.txt", "tracked.txt",
+                 "debug.log", "ignored/secret.txt", "ignored/new.txt"},
+            )
+            self.assertEqual(files["debug.log"], b"ignored log\n")
+            self.assertEqual(files["ignored/secret.txt"], b"ignored\n")
+            self.assertEqual(files["ignored/new.txt"], b"ignored nested\n")
+            self.assertEqual(result.path.name, "project-with-ignored.zip")
 
     def test_head_does_not_apply_git_export_ignore(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -171,13 +193,20 @@ class PackageTests(unittest.TestCase):
             root = self._repo(tmp)
 
             worktree = package_project(root, scope=PACKAGE_WORKTREE)
+            worktree_ignored = package_project(
+                root, scope=PACKAGE_WORKTREE_IGNORED)
             staged = package_project(root, scope=PACKAGE_STAGED)
             head = package_project(root, scope=PACKAGE_HEAD)
 
             self.assertEqual(worktree.path.name, f"{root.name}.zip")
+            self.assertEqual(
+                worktree_ignored.path.name,
+                f"{root.name}-with-ignored.zip",
+            )
             self.assertEqual(staged.path.name, f"{root.name}-staged.zip")
             self.assertEqual(head.path.name, f"{root.name}-head.zip")
             self.assertTrue(worktree.path.exists())
+            self.assertTrue(worktree_ignored.path.exists())
             self.assertTrue(staged.path.exists())
             self.assertTrue(head.path.exists())
 
@@ -215,19 +244,24 @@ class PackageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = self._repo(tmp)
             worktree = package_project(root, scope=PACKAGE_WORKTREE)
+            worktree_ignored = package_project(
+                root, scope=PACKAGE_WORKTREE_IGNORED
+            )
             head = package_project(root, scope=PACKAGE_HEAD)
             import os
             os.utime(worktree.path, ns=(1_000_000_000, 1_000_000_000))
+            os.utime(worktree_ignored.path, ns=(3_000_000_000, 3_000_000_000))
             os.utime(head.path, ns=(2_000_000_000, 2_000_000_000))
 
             discovered = discover_latest_package(root)
 
             self.assertIsNotNone(discovered)
             assert discovered is not None
-            self.assertEqual(discovered.path, head.path)
-            self.assertEqual(discovered.scope, PACKAGE_HEAD)
-            self.assertEqual(discovered.files, head.files)
-            self.assertEqual(discovered.size_bytes, head.size_bytes)
+            self.assertEqual(discovered.path, worktree_ignored.path)
+            self.assertEqual(discovered.scope, PACKAGE_WORKTREE_IGNORED)
+            self.assertEqual(discovered.files, worktree_ignored.files)
+            self.assertEqual(discovered.size_bytes,
+                             worktree_ignored.size_bytes)
 
     def test_discover_ignores_corrupt_canonical_package(self):
         with tempfile.TemporaryDirectory() as tmp:

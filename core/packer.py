@@ -8,6 +8,7 @@ import subprocess
 import zipfile
 
 PACKAGE_WORKTREE = "worktree"
+PACKAGE_WORKTREE_IGNORED = "worktree-with-ignored"
 PACKAGE_STAGED = "staged"
 PACKAGE_HEAD = "head"
 
@@ -68,15 +69,31 @@ def _decode_git_paths(data: bytes) -> list[str]:
     return [item for item in text.split("\0") if item]
 
 
-def _worktree_files(root: Path) -> tuple[list[str], tuple[str, ...]]:
+def _worktree_files(
+    root: Path, *, include_ignored: bool = False
+) -> tuple[list[str], tuple[str, ...]]:
     tracked = _decode_git_paths(_git(root, "ls-files", "-z"))
     untracked = _decode_git_paths(
         _git(root, "ls-files", "-z", "--others", "--exclude-standard")
     )
+    ignored = (
+        _decode_git_paths(
+            _git(
+                root,
+                "ls-files",
+                "-z",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+            )
+        )
+        if include_ignored
+        else []
+    )
 
     seen: set[str] = set()
     relative: list[str] = []
-    for name in [*tracked, *untracked]:
+    for name in [*tracked, *untracked, *ignored]:
         normalized = name.replace("\\", "/")
         if normalized in seen:
             continue
@@ -100,6 +117,7 @@ def _worktree_files(root: Path) -> tuple[list[str], tuple[str, ...]]:
 def _scope_name(scope: str) -> str:
     return {
         PACKAGE_WORKTREE: "",
+        PACKAGE_WORKTREE_IGNORED: "-with-ignored",
         PACKAGE_STAGED: "-staged",
         PACKAGE_HEAD: "-head",
     }[scope]
@@ -115,6 +133,7 @@ def _cleanup_obsolete_generated_packages(root: Path, scope: str, current: Path) 
     base = root.name or "project"
     scope_name = {
         PACKAGE_WORKTREE: "worktree",
+        PACKAGE_WORKTREE_IGNORED: "worktree-with-ignored",
         PACKAGE_STAGED: "staged",
         PACKAGE_HEAD: "head",
     }[scope]
@@ -150,7 +169,12 @@ def discover_latest_package(project_root: Path) -> PackageResult | None:
         return None
 
     candidates = []
-    for scope in (PACKAGE_WORKTREE, PACKAGE_STAGED, PACKAGE_HEAD):
+    for scope in (
+        PACKAGE_WORKTREE,
+        PACKAGE_WORKTREE_IGNORED,
+        PACKAGE_STAGED,
+        PACKAGE_HEAD,
+    ):
         path = _output_path(root, scope)
         if not path.is_file():
             continue
@@ -270,8 +294,10 @@ def _archive_git_tree(root: Path, treeish: str, output: Path) -> int:
     return len(entries)
 
 
-def _archive_worktree(root: Path, output: Path) -> tuple[int, tuple[str, ...]]:
-    names, missing = _worktree_files(root)
+def _archive_worktree(
+    root: Path, output: Path, *, include_ignored: bool = False
+) -> tuple[int, tuple[str, ...]]:
+    names, missing = _worktree_files(root, include_ignored=include_ignored)
     with zipfile.ZipFile(
         output,
         mode="w",
@@ -291,7 +317,12 @@ def package_project(
     output_path: Path | None = None,
 ) -> PackageResult:
     root = project_root.resolve()
-    if scope not in {PACKAGE_WORKTREE, PACKAGE_STAGED, PACKAGE_HEAD}:
+    if scope not in {
+        PACKAGE_WORKTREE,
+        PACKAGE_WORKTREE_IGNORED,
+        PACKAGE_STAGED,
+        PACKAGE_HEAD,
+    }:
         raise ValueError(f"Unknown package scope: {scope}")
 
     _require_repo(root)
@@ -314,6 +345,10 @@ def package_project(
 
         if scope == PACKAGE_WORKTREE:
             files, missing = _archive_worktree(root, temp_output)
+        elif scope == PACKAGE_WORKTREE_IGNORED:
+            files, missing = _archive_worktree(
+                root, temp_output, include_ignored=True
+            )
         elif scope == PACKAGE_HEAD:
             files = _archive_git_tree(root, "HEAD", temp_output)
             missing = ()

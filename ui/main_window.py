@@ -23,6 +23,7 @@ from core.packer import (
     PACKAGE_HEAD,
     PACKAGE_STAGED,
     PACKAGE_WORKTREE,
+    PACKAGE_WORKTREE_IGNORED,
     PackageResult,
     package_project,
     discover_latest_package,
@@ -213,6 +214,7 @@ class DraggableArchive(QFrame):
 
         scope_names = {
             PACKAGE_WORKTREE: "Working tree",
+            PACKAGE_WORKTREE_IGNORED: "Working tree + ignored",
             PACKAGE_STAGED: "Staged",
             PACKAGE_HEAD: "HEAD",
         }
@@ -282,9 +284,10 @@ class DraggableArchive(QFrame):
     @staticmethod
     def _scope_tooltip(scope: str) -> str:
         return {
-            PACKAGE_WORKTREE: "tracked + non-ignored untracked files",
-            PACKAGE_STAGED: "current Git index",
-            PACKAGE_HEAD: "last committed state",
+            PACKAGE_WORKTREE: "Current project files, excluding files ignored by Git",
+            PACKAGE_WORKTREE_IGNORED: "Current project files, including files ignored by Git",
+            PACKAGE_STAGED: "Files currently staged in Git",
+            PACKAGE_HEAD: "Latest committed version",
         }.get(scope, scope)
 
     @staticmethod
@@ -353,9 +356,6 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("LLM Drop-In")
-        app = QApplication.instance()
-        if app is not None and not app.windowIcon().isNull():
-            self.setWindowIcon(app.windowIcon())
         self.resize(940, 760)
         self.setMinimumSize(760, 640)
         self.settings = load_settings()
@@ -513,6 +513,7 @@ class MainWindow(QMainWindow):
         base = project.resolve().name or "project"
         return path.resolve() in {
             project.resolve().parent / f"{base}.zip",
+            project.resolve().parent / f"{base}-with-ignored.zip",
             project.resolve().parent / f"{base}-staged.zip",
             project.resolve().parent / f"{base}-head.zip",
         }
@@ -599,11 +600,13 @@ class MainWindow(QMainWindow):
         set_style_class(self.package_menu_button, "primary-button")
         self.package_menu_button.setFixedSize(28, 40)
         self.package_menu_button.setToolTip(
-            "Choose whether to package the working tree, staged state, or HEAD."
+            "Choose what to include in the project ZIP."
         )
         package_menu = QMenu(self.package_menu_button)
         for scope, text in (
             (PACKAGE_WORKTREE, "Create from working tree"),
+            (PACKAGE_WORKTREE_IGNORED,
+             "Create from working tree (include ignored files)"),
             (PACKAGE_STAGED, "Create from staged state"),
             (PACKAGE_HEAD, "Create from HEAD"),
         ):
