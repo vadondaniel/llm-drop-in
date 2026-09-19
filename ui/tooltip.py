@@ -230,6 +230,11 @@ class StyledToolTipController(QObject):
             and text == self._visible_text
             and self._tooltip.isVisible()
         ):
+            # Keep the tooltip anchored to the cursor while it remains over
+            # the same target. The target/text do not change as the cursor
+            # moves within a widget, so without this update the popup would
+            # stay at the position where it was originally shown.
+            self._place_tooltip()
             return
 
         if target is self._pending_target and text == self._pending_text:
