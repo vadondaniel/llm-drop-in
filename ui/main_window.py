@@ -167,18 +167,24 @@ class DraggableArchive(QFrame):
         self.setObjectName("DraggableArchive")
         set_style_class(self, "surface-alt")
         self.setCursor(Qt.CursorShape.OpenHandCursor)
-        self.setToolTip(
-            "Drag this ZIP into the browser chat to upload it. "
-            "The file is stored next to the project."
-        )
-
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 9, 12, 9)
         layout.setSpacing(2)
 
-        self.name_label = DraggableArchiveLabel(self)
+        name_row = QHBoxLayout()
+        name_row.setContentsMargins(0, 0, 0, 0)
+        name_row.setSpacing(6)
+
+        self.name_label = DraggableArchiveLabel(self, result.path.name)
         self.name_label.setObjectName("ArchiveName")
-        layout.addWidget(self.name_label)
+        name_row.addWidget(self.name_label)
+
+        self.time_label = DraggableArchiveLabel(self)
+        self.time_label.setObjectName("ArchiveTime")
+        set_style_class(self.time_label, "subtle")
+        name_row.addWidget(self.time_label)
+        name_row.addStretch(1)
+        layout.addLayout(name_row)
 
         metadata_layout = QHBoxLayout()
         metadata_layout.setContentsMargins(0, 0, 0, 0)
@@ -249,11 +255,11 @@ class DraggableArchive(QFrame):
         return f"{days}d ago"
 
     def _update_time_display(self) -> None:
-        exact = self._created_at.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+        exact = self._created_at.astimezone().strftime("%d %b %Y, %H:%M:%S")
         relative = self._relative_time(self._created_at)
-        self.name_label.setText(f"{self.result.path.name} · {relative}")
-        self.name_label.setToolTip(
-            f"<b>{escape(self.result.path.name)}</b><br>Created {escape(exact)}"
+        self.time_label.setText(f"{relative}")
+        self.time_label.setToolTip(
+            f"<b>Created</b><br>{escape(exact)}"
         )
 
     def _try_start_drag(self, buttons, global_pos: QPoint) -> None:
