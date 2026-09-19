@@ -344,6 +344,19 @@ def mark_undone(history_id: str) -> HistoryEntry | None:
     return found
 
 
+def remove_history_entry(history_id: str) -> bool:
+    """Remove one history entry and discard any retained undo transaction."""
+    history = load_history()
+    target = next((entry for entry in history if entry.id == history_id), None)
+    if target is None:
+        return False
+
+    updated = [entry for entry in history if entry.id != history_id]
+    save_history(updated)
+    _discard_transaction(target.transaction_id)
+    return True
+
+
 def mark_undo_unavailable(history_id: str, *, failed: bool = False) -> HistoryEntry | None:
     history = load_history()
     updated: list[HistoryEntry] = []

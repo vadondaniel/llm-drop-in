@@ -288,6 +288,32 @@ class ImportHistoryTests(unittest.TestCase):
                 self.assertEqual(updated_again.undo_state,
                                  history_module.UNDO_UNAVAILABLE)
 
+    def test_remove_history_entry_removes_entry_and_discards_undo_transaction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self._patch_store(tmp):
+                project = Path(tmp) / "project"
+                project.mkdir()
+                tx_dir = Path(tmp) / "transactions" / "tx-remove"
+                tx_dir.mkdir(parents=True)
+                (tx_dir / "manifest.json").write_text(
+                    json.dumps({"files": []}), encoding="utf-8")
+                entry = self._entry(project, entry_id="remove", tx="tx-remove")
+                entry = history_module.HistoryEntry(
+                    **{**entry.__dict__, "id": "remove"})
+                history_module.save_history([entry])
+
+                self.assertTrue(history_module.remove_history_entry("remove"))
+                self.assertEqual(history_module.load_history(), [])
+                self.assertFalse(tx_dir.exists())
+
+    def test_remove_missing_history_entry_is_a_noop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self._patch_store(tmp):
+                project = Path(tmp) / "project"
+                project.mkdir()
+                self.assertFalse(
+                    history_module.remove_history_entry("missing"))
+
     def test_mark_undo_failed_preserves_applied_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             with self._patch_store(tmp):

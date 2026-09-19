@@ -21,6 +21,7 @@ from core.import_history import (
     mark_undo_unavailable,
     reconcile_import_history,
     record_undo_failure,
+    remove_history_entry,
 )
 from core.settings import load_settings, save_settings, remember_project
 from core.zip_analyzer import (
@@ -75,10 +76,22 @@ class HistoryItemDelegate(QStyledItemDelegate):
         if entry.is_noop:
             return "No changes", "info"
         if entry.undo_state == "AVAILABLE":
-            return "Undo available", "success"
+            return "Undo", "success"
         if entry.undo_state == "FAILED":
-            return "Undo failed", "danger"
-        return "Undo unavailable", "warning"
+            return "Failed", "danger"
+        return "No undo", "warning"
+
+    @staticmethod
+    def _status_description(entry: HistoryEntry) -> str:
+        if entry.state == "UNDONE":
+            return "Undo completed"
+        if entry.is_noop:
+            return "No file changes"
+        if entry.undo_state == "AVAILABLE":
+            return "Undo available"
+        if entry.undo_state == "FAILED":
+            return "Undo failed"
+        return "Undo unavailable"
 
     @staticmethod
     def _counts(entry: HistoryEntry) -> str:
@@ -1116,7 +1129,7 @@ class MainWindow(QMainWindow):
     def _make_history_item(self, entry: HistoryEntry) -> QListWidgetItem:
         item = QListWidgetItem(entry.source_zip_name)
         counts = HistoryItemDelegate._counts(entry)
-        status_text, _status_tone = HistoryItemDelegate._status(entry)
+        status_description = HistoryItemDelegate._status_description(entry)
         timestamp = HistoryItemDelegate._exact_timestamp(entry)
         source_path = entry.source_zip_path or "(source path unavailable)"
         source_missing = bool(entry.source_zip_path) and not Path(
@@ -1125,7 +1138,7 @@ class MainWindow(QMainWindow):
         tooltip = (
             f"<b>{escape(entry.source_zip_name)}</b><br>"
             f"{escape(counts)}<br>"
-            f"{escape(timestamp)} · {escape(status_text)}<br>"
+            f"{escape(timestamp)} · {escape(status_description)}<br>"
             f"{escape(source_path)}"
         )
         if source_missing:
@@ -1156,7 +1169,45 @@ class MainWindow(QMainWindow):
         elif entry.undo_state != "AVAILABLE":
             undo_action.setText("Undo import (undo data unavailable)")
         undo_action.triggered.connect(self._undo_history_item)
+
+        menu.addSeparator()
+        remove_action = menu.addAction("Remove from history")
+        remove_action.setEnabled(self.worker_thread is None)
+        remove_action.triggered.connect(
+            lambda _checked=False, history_id=entry.id: self._remove_history_item(
+                history_id)
+        )
         menu.exec(self.history.viewport().mapToGlobal(position))
+
+    def _remove_history_item(self, history_id: str):
+        entry = None
+        for index in range(self.history.count()):
+            item = self.history.item(index)
+            candidate = item.data(Qt.ItemDataRole.UserRole)
+            if isinstance(candidate, HistoryEntry) and candidate.id == history_id:
+                entry = candidate
+                break
+        if entry is None or self.worker_thread is not None:
+            return
+
+        if entry.can_undo:
+            answer = QMessageBox.question(
+                self,
+                "Remove import history entry",
+                (
+                    f"Remove {entry.source_zip_name!r} from Recent imports?\n\n"
+                    "This does not change the imported files, but it will permanently discard "
+                    "the data needed to undo this import."
+                ),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+
+        if not remove_history_entry(history_id):
+            return
+        self._refresh_import_history()
 
     def _restore_latest_package(self):
         project = self.project
