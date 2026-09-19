@@ -1,65 +1,106 @@
 # LLM Drop-In
 
-A small PySide6 Windows utility for dropping LLM-generated ZIPs onto a selected project and safely applying the files they contain.
+LLM Drop-In makes it easy to move project files between your computer and an LLM chat.
 
-## Features
+The usual workflow is:
 
-- Select and remember a project folder.
-- Drag/drop a ZIP or choose one from a file dialog.
-- Detect common extra wrapper directories automatically.
-- Match ZIP files to the selected project without flattening paths.
-- Preview modified/new/unchanged files before applying.
-- Select individual files to import.
-- Detect duplicate/case-colliding archive paths and unsafe Windows paths.
-- Detect suspiciously large/compressed archives before extraction.
-- Stage and verify every file before committing an import.
-- Roll back already-committed files if a commit fails.
-- Skip unchanged files rather than rewriting them.
-- Never delete project files merely because they are absent from the ZIP.
-- Keep a local import history.
-- Run archive analysis in a worker thread so the UI stays responsive.
-- Exclude files matched by Git ignore rules by default, with an option to include them.
-- Create a project ZIP directly from the selected folder and drag the result into a browser chat.
-- Package the current working tree, the staged Git index, or the last committed HEAD snapshot.
-- Keep one generated ZIP per package scope, using stable names such as `project.zip`, `project-staged.zip`, and `project-head.zip`; replacement happens through a temporary archive so the previous package survives until the new one is complete.
-- Optionally monitor a chosen downloads folder for newly downloaded ZIPs, wait for them to finish downloading and validate them before analysis, then open the normal import review for the current project.
+**Project → ZIP → LLM → ZIP → Review → Project**
+
+## Getting started
+
+1. Open LLM Drop-In and choose the project folder you want to work on.
+2. Click **Create ZIP** and choose what to package.
+3. Drag the ZIP into your LLM chat and ask for the changes you want.
+4. Download the ZIP the LLM gives you.
+5. Drag that ZIP into LLM Drop-In, or click **Select LLM ZIP**.
+6. Review the files and select the changes you want to bring into the project.
+7. Click **Apply selected**.
+
+You can use the ZIP exactly as it was downloaded. There is no need to unpack it first.
+
+## Reviewing an LLM ZIP
+
+Before anything is changed, LLM Drop-In shows you what the ZIP contains for the selected project.
+
+You can see which files are new, changed, or unchanged, inspect individual changes, and choose which files to apply.
+
+The app checks the ZIP before import and can warn you when it appears to belong to a different project. Invalid or incomplete ZIPs are not imported.
+
+After an import, the operation appears under **Recent imports**. Imports that still have undo information can be reversed with **Undo selected import**.
+
+## Watching downloads automatically
+
+You can enable **Watch downloads** to have LLM Drop-In keep an eye on your Downloads folder, or another folder you choose, for new ZIPs.
+
+When a new ZIP is downloaded, the app waits for the download to finish and can bring it into the same review flow as a ZIP you selected manually. It can warn you when it is not clear that the ZIP belongs to the current project.
+
+Downloads that clearly belong to another project are ignored.
+
+The download folder and monitoring setting are remembered between launches.
+
+## Creating a ZIP for an LLM
+
+Click **Create ZIP** to package the current project.
+
+You can choose between:
+
+- **Working tree** — the files currently in the project, including untracked files that are not ignored by Git.
+- **Staged** — the files you currently have staged in Git.
+- **HEAD** — the latest committed version in Git.
+
+Git-ignored files are excluded from the **Working tree** package.
+
+Once the ZIP is created, it is available in the app as a draggable file, so you can drop it directly into a browser chat.
 
 ## Requirements
 
-- Windows 10/11
-- Python 3.10+
-- PySide6
-- Git (used when available for Git ignore-rule matching)
+For everyday use, use the packaged Windows application so Python does not need to be installed separately.
 
-Install:
+To run the project from source, you need:
+
+- Windows 10 or 11
+- Python 3.10 or newer
+- PySide6
+- Git for the Git-related packaging options
+
+Install the Python dependency with:
 
 ```powershell
 py -m pip install PySide6
 ```
 
-Run:
+Then run:
 
 ```powershell
 py main.py
 ```
 
-Run tests:
+## Developer guide
+
+### Tests
+
+Run the behavioral test suite with:
 
 ```powershell
 py -m unittest discover -s core -p "test_*.py"
 ```
 
-## Optional build
+### Building the Windows application
 
-With PyInstaller:
+Install the build dependencies:
 
 ```powershell
 py -m pip install -r requirements-build.txt
+```
+
+Build with:
+
+```powershell
 pyinstaller --noconfirm --clean LLM-Drop-In.spec
 ```
 
-`LLM-Drop-In.spec` is the **single authoritative build configuration**. The spec uses PyInstaller's `SPECPATH` value to locate project files, so it works when the spec is executed normally by PyInstaller. There is deliberately no second build script to keep in sync with it. The resulting application is `dist\LLM-Drop-In\LLM-Drop-In.exe`.
+The executable is created at:
 
-The distribution uses **onedir** rather than onefile: startup is faster, the packaged files are inspectable when diagnosing a user report, and the application does not need to unpack itself into a temporary directory on every launch. UPX compression is intentionally disabled for a more predictable Qt/Windows build.
-
-The spec also embeds `app.ico` into the executable and bundles a runtime copy beside it. The application sets a stable Windows AppUserModelID before creating `QApplication`, so Windows can associate the process with the LLM Drop-In icon on the taskbar.
+```text
+dist\LLM-Drop-In\LLM-Drop-In.exe
+```
