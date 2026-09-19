@@ -30,6 +30,7 @@ from core.packer import (
 )
 from ui.import_preview import ImportPreviewDialog
 from ui.theme import apply_theme, set_style_class
+from ui.formatting import format_bytes
 
 
 class ZipWorker(QObject):
@@ -227,7 +228,7 @@ class DraggableArchive(QFrame):
         metadata_layout.addWidget(self.scope_label)
 
         self.detail_label = QLabel(
-            f"{result.files:,} files · {result.size_bytes / (1024 * 1024):.2f} MB"
+            f"{result.files:,} files · {format_bytes(result.size_bytes)}"
         )
         self.detail_label.setObjectName("ArchiveMetadata")
         self.detail_label.setAttribute(
@@ -949,14 +950,10 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _format_package_status(result: PackageResult) -> str:
-        size = result.size_bytes
-        if size >= 1024 * 1024:
-            size_text = f"{size / (1024 * 1024):.2f} MB"
-        elif size >= 1024:
-            size_text = f"{size / 1024:.1f} KB"
-        else:
-            size_text = f"{size} B"
-        return f"Created {result.path.name} · {result.files:,} files · {size_text}"
+        return (
+            f"Created {result.path.name} · {result.files:,} files · "
+            f"{format_bytes(result.size_bytes)}"
+        )
 
     def _create_package(self, scope: str):
         if self.worker_thread is not None:
