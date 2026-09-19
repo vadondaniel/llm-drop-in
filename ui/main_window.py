@@ -353,6 +353,9 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("LLM Drop-In")
+        app = QApplication.instance()
+        if app is not None and not app.windowIcon().isNull():
+            self.setWindowIcon(app.windowIcon())
         self.resize(940, 760)
         self.setMinimumSize(760, 640)
         self.settings = load_settings()
