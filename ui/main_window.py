@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QDialog, QProgressBar, QAbstractItemView, QComboBox, QMenu, QStyledItemDelegate, QStyle, QStyleOptionViewItem,
 )
 
+from core.version import __version__
 from core.download_monitor import DownloadFolderMonitor
 from core.importer import apply_import, cleanup_orphaned_transactions, make_plan, undo_import
 from core.import_history import (
@@ -785,12 +786,19 @@ class MainWindow(QMainWindow):
 
         header = QHBoxLayout()
         header.setSpacing(16)
-        title_block = QVBoxLayout()
-        title_block.setSpacing(3)
+        title_block = QHBoxLayout()
+        title_block.setSpacing(10)
         title = QLabel("LLM Drop-In")
         title.setObjectName("WindowTitle")
         set_style_class(title, "title")
-        title_block.addWidget(title)
+        self._window_title_label = title
+        title_block.addWidget(title, 0, Qt.AlignmentFlag.AlignTop)
+        version = QLabel(f"v{__version__}")
+        version.setObjectName("AppVersion")
+        set_style_class(version, "subtle")
+        self._version_label = version
+        title_block.addWidget(version, 0, Qt.AlignmentFlag.AlignTop)
+        title_block.addStretch()
         header.addLayout(title_block, 1)
 
         # The built-in QToolButton menu subcontrol gets awkward quickly: its
@@ -1044,6 +1052,13 @@ class MainWindow(QMainWindow):
 
     def _theme_changed(self, _palette=None):
         self._theme_tokens = apply_theme(self)
+        # Keep the smaller version label's text baseline aligned with the title.
+        version_top = max(
+            0,
+            self._window_title_label.fontMetrics().ascent()
+            - self._version_label.fontMetrics().ascent(),
+        )
+        self._version_label.setContentsMargins(0, version_top, 0, 0)
         if hasattr(self, "history_delegate"):
             self.history_delegate.set_tokens(self._theme_tokens)
             self.history.viewport().update()
