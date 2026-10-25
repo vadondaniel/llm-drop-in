@@ -2,6 +2,10 @@
 
 LLM Drop-In makes it easy to move project files between your computer and an LLM chat.
 
+![LLM Drop-In main window](assets/screenshot.png)
+
+![Import review window](assets/import-review.png)
+
 The usual workflow is:
 
 **Project → ZIP → LLM → ZIP → Review → Project**
