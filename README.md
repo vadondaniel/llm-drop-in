@@ -2,6 +2,8 @@
 
 LLM Drop-In makes it easy to move project files between your computer and an LLM chat.
 
+Download the Windows app from [GitHub Releases](https://github.com/vadondaniel/llm-drop-in/releases).
+
 ![LLM Drop-In main window](assets/screenshot.png)
 
 ![Import review window](assets/import-review.png)

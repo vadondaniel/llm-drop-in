@@ -7,6 +7,7 @@ from pathlib import Path
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
+from core.version import __version__
 from ui.main_window import MainWindow
 from ui.tooltip import StyledToolTipController
 
@@ -40,6 +41,7 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("LLM Drop-In")
     app.setApplicationDisplayName("LLM Drop-In")
+    app.setApplicationVersion(__version__)
 
     icon_path = _app_icon_path()
     if icon_path.is_file():
